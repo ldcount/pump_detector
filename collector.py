@@ -53,21 +53,28 @@ def fetch_mark_prices() -> list[tuple[str, float]]:
 def compute_price_changes(
     current_prices: dict[str, float],
     time_window_minutes: int,
-) -> dict[str, float]:
-    """Return {symbol: change_pct} for a given time window.
+) -> dict[str, dict[str, float]]:
+    """Return {symbol: {'pump': pct, 'dump': pct}} for a given time window.
 
-    Positive values = pump, negative values = dump.
+    Pump is calculated from the lowest price in the window up to the current price.
+    Dump is calculated from the highest price in the window down to the current price.
     Only symbols that have a historical price available are included.
     """
     target_ts = time.time() - time_window_minutes * 60
-    old_prices = db.get_all_symbols_price_at(target_ts)
+    extremes = db.get_all_symbols_extremes_since(target_ts)
 
-    changes: dict[str, float] = {}
+    changes: dict[str, dict[str, float]] = {}
     for symbol, current in current_prices.items():
-        old = old_prices.get(symbol)
-        if old and old > 0:
-            pct = (current / old - 1) * 100
-            changes[symbol] = round(pct, 2)
+        ext = extremes.get(symbol)
+        if ext:
+            min_p = ext.get("min")
+            max_p = ext.get("max")
+            pump_pct = (current / min_p - 1) * 100 if min_p and min_p > 0 else 0
+            dump_pct = (current / max_p - 1) * 100 if max_p and max_p > 0 else 0
+            changes[symbol] = {
+                "pump": round(pump_pct, 2),
+                "dump": round(dump_pct, 2),
+            }
     return changes
 
 
@@ -100,7 +107,7 @@ async def collect_and_alert(bot) -> None:
         windows.add(u["dump_time_window"])
 
     # 5. Compute price changes per window
-    change_results: dict[int, dict[str, float]] = {}
+    change_results: dict[int, dict[str, dict[str, float]]] = {}
     for w in windows:
         change_results[w] = compute_price_changes(current_map, w)
 
@@ -118,7 +125,8 @@ async def _check_pumps(bot, user, change_results, now, uid):
     tw = user["pump_time_window"]
     changes = change_results.get(tw, {})
 
-    for symbol, pct in changes.items():
+    for symbol, data in changes.items():
+        pct = data.get("pump", 0)
         if pct >= threshold:
             key = (uid, symbol, tw, "pump")
             last = _alert_cooldown.get(key, 0)
@@ -147,7 +155,8 @@ async def _check_dumps(bot, user, change_results, now, uid):
     tw = user["dump_time_window"]
     changes = change_results.get(tw, {})
 
-    for symbol, pct in changes.items():
+    for symbol, data in changes.items():
+        pct = data.get("dump", 0)
         # Dump = negative change whose absolute value exceeds the threshold
         if pct <= -threshold:
             key = (uid, symbol, tw, "dump")

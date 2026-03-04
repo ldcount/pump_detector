@@ -103,20 +103,19 @@ def get_price_at(symbol: str, target_ts: float) -> float | None:
     return row["price"] if row else None
 
 
-def get_all_symbols_price_at(target_ts: float) -> dict[str, float]:
-    """Return {symbol: price} closest to *target_ts* for every symbol."""
+def get_all_symbols_extremes_since(target_ts: float) -> dict[str, dict[str, float]]:
+    """Return {symbol: {'min': min_price, 'max': max_price}} since *target_ts*."""
     with _conn() as con:
         rows = con.execute(
             """
-            SELECT symbol, price,
-                   MIN(ABS(timestamp - ?)) AS dist
+            SELECT symbol, MIN(price) AS min_price, MAX(price) AS max_price
             FROM price_log
-            WHERE timestamp BETWEEN ? AND ?
+            WHERE timestamp >= ?
             GROUP BY symbol
             """,
-            (target_ts, target_ts - 120, target_ts + 120),
+            (target_ts,),
         ).fetchall()
-    return {r["symbol"]: r["price"] for r in rows}
+    return {r["symbol"]: {"min": r["min_price"], "max": r["max_price"]} for r in rows}
 
 
 def purge_old(hours: int = RETENTION_HOURS) -> int:

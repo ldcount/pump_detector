@@ -242,7 +242,7 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     state = "⏸ Paused" if user["is_paused"] else "▶️ Active"
     await update.message.reply_text(
-        f"📊 *Current Settings*\n\n"
+        f"📐 *Current Settings*\n\n"
         f"📡 Scan frequency: *{user['scan_frequency']}s*\n\n"
         f"📈 Pump threshold: *{user['pump_threshold']}%*\n"
         f"⏱ Pump window: *{user['pump_time_window']} min*\n\n"
