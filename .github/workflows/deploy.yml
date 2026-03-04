@@ -1,0 +1,34 @@
+name: Continuous Deployment
+
+on:
+  push:
+    branches: [ master ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.REMOTE_HOST }}
+          username: ${{ secrets.REMOTE_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            cd /opt/bots/pump_detector
+            
+            # Critical Ownership Fix for Root/Deploy conflict
+            git config --global --add safe.directory /opt/bots/pump_detector
+            
+            # Sync Files
+            git fetch origin master
+            git reset --hard origin/master
+            
+            # Update Environment
+            ./venv/bin/pip install -r requirements.txt
+            
+            # Restart Service
+            sudo systemctl restart pump_detector.service
+            systemctl is-active pump_detector.service
