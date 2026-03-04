@@ -1,0 +1,26 @@
+# Virtual environment
+.venv/
+venv/
+
+# Environment variables / secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# SQLite database
+*.db
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
