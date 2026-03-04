@@ -1,4 +1,4 @@
-"""Global Bybit price collector, pump detection, and alert fan-out."""
+"""Global Bybit price collector, pump/dump detection, and alert fan-out."""
 
 import logging
 import time
@@ -9,13 +9,12 @@ import db
 from config import (
     ALERT_COOLDOWN_SECONDS,
     BYBIT_TRADE_URL,
-    GLOBAL_TICK_INTERVAL,
 )
 
 logger = logging.getLogger(__name__)
 
 # ── In-memory alert cooldown tracker ─────────────────────
-# Key: (user_id, symbol, time_window)  →  last_alert_ts
+# Key: (user_id, symbol, time_window, direction)  →  last_alert_ts
 _alert_cooldown: dict[tuple, float] = {}
 
 
@@ -48,34 +47,35 @@ def fetch_mark_prices() -> list[tuple[str, float]]:
         return []
 
 
-# ── Pump detection ───────────────────────────────────────
+# ── Price change detection ───────────────────────────────
 
 
-def compute_pumps(
+def compute_price_changes(
     current_prices: dict[str, float],
     time_window_minutes: int,
 ) -> dict[str, float]:
-    """Return {symbol: pump_pct} for a given time window.
+    """Return {symbol: change_pct} for a given time window.
 
+    Positive values = pump, negative values = dump.
     Only symbols that have a historical price available are included.
     """
     target_ts = time.time() - time_window_minutes * 60
     old_prices = db.get_all_symbols_price_at(target_ts)
 
-    pumps: dict[str, float] = {}
+    changes: dict[str, float] = {}
     for symbol, current in current_prices.items():
         old = old_prices.get(symbol)
         if old and old > 0:
             pct = (current / old - 1) * 100
-            pumps[symbol] = round(pct, 2)
-    return pumps
+            changes[symbol] = round(pct, 2)
+    return changes
 
 
 # ── Alert fan-out ────────────────────────────────────────
 
 
 async def collect_and_alert(bot) -> None:
-    """Run one collection cycle: fetch prices → detect pumps → send alerts."""
+    """Run one collection cycle: fetch prices → detect pumps/dumps → send alerts."""
     prices = fetch_mark_prices()
     if not prices:
         return
@@ -88,48 +88,87 @@ async def collect_and_alert(bot) -> None:
 
     current_map = {sym: px for sym, px in prices}
 
-    # 3. Get active users and their distinct time windows
+    # 3. Get active users
     users = db.get_all_active_users()
     if not users:
         return
 
-    windows = {u["time_window"] for u in users}
+    # 4. Collect all distinct time windows (pump + dump)
+    windows: set[int] = set()
+    for u in users:
+        windows.add(u["pump_time_window"])
+        windows.add(u["dump_time_window"])
 
-    # 4. Compute pumps per window
-    pump_results: dict[int, dict[str, float]] = {}
+    # 5. Compute price changes per window
+    change_results: dict[int, dict[str, float]] = {}
     for w in windows:
-        pump_results[w] = compute_pumps(current_map, w)
+        change_results[w] = compute_price_changes(current_map, w)
 
-    # 5. Fan-out alerts
+    # 6. Fan-out alerts
     now = time.time()
     for user in users:
         uid = user["user_id"]
-        threshold = user["pump_threshold"]
-        tw = user["time_window"]
-        pumps = pump_results.get(tw, {})
+        await _check_pumps(bot, user, change_results, now, uid)
+        await _check_dumps(bot, user, change_results, now, uid)
 
-        for symbol, pct in pumps.items():
-            if pct >= threshold:
-                key = (uid, symbol, tw)
-                last = _alert_cooldown.get(key, 0)
-                if now - last < ALERT_COOLDOWN_SECONDS:
-                    continue  # suppress duplicate alert
 
-                _alert_cooldown[key] = now
+async def _check_pumps(bot, user, change_results, now, uid):
+    """Send pump alerts for a single user."""
+    threshold = user["pump_threshold"]
+    tw = user["pump_time_window"]
+    changes = change_results.get(tw, {})
 
-                # Build readable coin name (strip trailing "USDT")
-                coin = symbol.replace("USDT", "")
-                url = BYBIT_TRADE_URL.format(symbol=symbol)
-                text = f"🟢Pump: [{coin}]({url}): {pct}%"
+    for symbol, pct in changes.items():
+        if pct >= threshold:
+            key = (uid, symbol, tw, "pump")
+            last = _alert_cooldown.get(key, 0)
+            if now - last < ALERT_COOLDOWN_SECONDS:
+                continue
 
-                try:
-                    await bot.send_message(
-                        chat_id=uid,
-                        text=text,
-                        parse_mode="Markdown",
-                    )
-                except Exception:
-                    logger.exception("Failed to send alert to user %s", uid)
+            _alert_cooldown[key] = now
+            coin = symbol.replace("USDT", "")
+            url = BYBIT_TRADE_URL.format(symbol=symbol)
+            text = f"🟢Pump - {tw}m: [{coin}]({url}): {pct}%"
+
+            try:
+                await bot.send_message(
+                    chat_id=uid,
+                    text=text,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                logger.exception("Failed to send pump alert to user %s", uid)
+
+
+async def _check_dumps(bot, user, change_results, now, uid):
+    """Send dump alerts for a single user."""
+    threshold = user["dump_threshold"]
+    tw = user["dump_time_window"]
+    changes = change_results.get(tw, {})
+
+    for symbol, pct in changes.items():
+        # Dump = negative change whose absolute value exceeds the threshold
+        if pct <= -threshold:
+            key = (uid, symbol, tw, "dump")
+            last = _alert_cooldown.get(key, 0)
+            if now - last < ALERT_COOLDOWN_SECONDS:
+                continue
+
+            _alert_cooldown[key] = now
+            coin = symbol.replace("USDT", "")
+            url = BYBIT_TRADE_URL.format(symbol=symbol)
+            text = f"🔴Dump - {tw}m: [{coin}]({url}): {pct}%"
+
+            try:
+                await bot.send_message(
+                    chat_id=uid,
+                    text=text,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                logger.exception("Failed to send dump alert to user %s", uid)
 
 
 def cleanup_cooldown_cache() -> None:

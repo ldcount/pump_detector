@@ -21,12 +21,14 @@ import collector
 import db
 from config import (
     BOT_TOKEN,
+    DEFAULT_DUMP_THRESHOLD,
+    DEFAULT_DUMP_TIME_WINDOW,
     DEFAULT_PUMP_THRESHOLD,
+    DEFAULT_PUMP_TIME_WINDOW,
     DEFAULT_SCAN_FREQUENCY,
-    DEFAULT_TIME_WINDOW,
     GLOBAL_TICK_INTERVAL,
     MIN_SCAN_FREQUENCY,
-    PUMP_THRESHOLDS,
+    THRESHOLDS,
     TIME_WINDOWS,
 )
 
@@ -40,10 +42,16 @@ logger.setLevel(logging.INFO)
 
 
 # ── Conversation states ──────────────────────────────────
-ASK_FREQUENCY, ASK_THRESHOLD, ASK_WINDOW = range(3)
+(
+    ASK_FREQUENCY,
+    ASK_PUMP_THRESHOLD,
+    ASK_PUMP_WINDOW,
+    ASK_DUMP_THRESHOLD,
+    ASK_DUMP_WINDOW,
+) = range(5)
 
 
-# ── /start ───────────────────────────────────────────────
+# ── /start & /param ─────────────────────────────────────
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -51,7 +59,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         "👋 Welcome to *Pump Detector*!\n\n"
         "Let's configure your alert settings.\n\n"
-        "📡 *Step 1/3 – Scan frequency*\n"
+        "📡 *Step 1/5 – Scan frequency*\n"
         "How often (in seconds) should market prices be checked?\n"
         f"Minimum is *{MIN_SCAN_FREQUENCY}* seconds.\n\n"
         "Type a number:",
@@ -77,22 +85,21 @@ async def ask_frequency(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
     ctx.user_data["scan_frequency"] = freq
 
-    # Build threshold keyboard
     buttons = [
-        [InlineKeyboardButton(f"{t}%", callback_data=f"thresh_{t}")]
-        for t in PUMP_THRESHOLDS
+        [InlineKeyboardButton(f"{t}%", callback_data=f"pthresh_{t}")]
+        for t in THRESHOLDS
     ]
     await update.message.reply_text(
-        "📈 *Step 2/3 – Pump threshold*\n"
+        "📈 *Step 2/5 – Pump threshold*\n"
         "What minimum pump percentage should trigger an alert?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
-    return ASK_THRESHOLD
+    return ASK_PUMP_THRESHOLD
 
 
-async def ask_threshold(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive pump threshold callback and ask for time window."""
+async def ask_pump_threshold(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive pump threshold and ask for pump time window."""
     query = update.callback_query
     await query.answer()
 
@@ -100,43 +107,90 @@ async def ask_threshold(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data["pump_threshold"] = value
 
     buttons = [
-        [InlineKeyboardButton(f"{w} min", callback_data=f"window_{w}")]
+        [InlineKeyboardButton(f"{w} min", callback_data=f"pwindow_{w}")]
         for w in TIME_WINDOWS
     ]
     await query.edit_message_text(
-        "⏱ *Step 3/3 – Time window*\n"
+        "⏱ *Step 3/5 – Pump time window*\n"
         "Over how many minutes should the pump be measured?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
-    return ASK_WINDOW
+    return ASK_PUMP_WINDOW
 
 
-async def ask_window(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive time window callback, save settings, finish setup."""
+async def ask_pump_window(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive pump window and ask for dump threshold."""
     query = update.callback_query
     await query.answer()
 
-    window = int(query.data.split("_")[1])
+    ctx.user_data["pump_time_window"] = int(query.data.split("_")[1])
+
+    buttons = [
+        [InlineKeyboardButton(f"{t}%", callback_data=f"dthresh_{t}")]
+        for t in THRESHOLDS
+    ]
+    await query.edit_message_text(
+        "📉 *Step 4/5 – Dump threshold*\n"
+        "What minimum dump percentage should trigger an alert?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return ASK_DUMP_THRESHOLD
+
+
+async def ask_dump_threshold(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive dump threshold and ask for dump time window."""
+    query = update.callback_query
+    await query.answer()
+
+    value = float(query.data.split("_")[1])
+    ctx.user_data["dump_threshold"] = value
+
+    buttons = [
+        [InlineKeyboardButton(f"{w} min", callback_data=f"dwindow_{w}")]
+        for w in TIME_WINDOWS
+    ]
+    await query.edit_message_text(
+        "⏱ *Step 5/5 – Dump time window*\n"
+        "Over how many minutes should the dump be measured?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return ASK_DUMP_WINDOW
+
+
+async def ask_dump_window(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive dump window, save all settings, finish setup."""
+    query = update.callback_query
+    await query.answer()
+
+    dump_tw = int(query.data.split("_")[1])
     freq = ctx.user_data.get("scan_frequency", DEFAULT_SCAN_FREQUENCY)
-    threshold = ctx.user_data.get("pump_threshold", DEFAULT_PUMP_THRESHOLD)
+    pump_thresh = ctx.user_data.get("pump_threshold", DEFAULT_PUMP_THRESHOLD)
+    pump_tw = ctx.user_data.get("pump_time_window", DEFAULT_PUMP_TIME_WINDOW)
+    dump_thresh = ctx.user_data.get("dump_threshold", DEFAULT_DUMP_THRESHOLD)
 
     user_id = query.from_user.id
     db.upsert_user(
         user_id,
         scan_frequency=freq,
-        pump_threshold=threshold,
-        time_window=window,
+        pump_threshold=pump_thresh,
+        pump_time_window=pump_tw,
+        dump_threshold=dump_thresh,
+        dump_time_window=dump_tw,
         is_paused=0,
         is_setup_complete=1,
     )
 
     await query.edit_message_text(
         "✅ *Setup complete!*\n\n"
-        f"📡 Scan frequency: *{freq}s*\n"
-        f"📈 Pump threshold: *{threshold}%*\n"
-        f"⏱ Time window: *{window} min*\n\n"
-        "You will now receive alerts when a coin pumps above your threshold.\n"
+        f"📡 Scan frequency: *{freq}s*\n\n"
+        f"📈 Pump threshold: *{pump_thresh}%*\n"
+        f"⏱ Pump window: *{pump_tw} min*\n\n"
+        f"📉 Dump threshold: *{dump_thresh}%*\n"
+        f"⏱ Dump window: *{dump_tw} min*\n\n"
+        "You will now receive alerts for pumps and dumps.\n"
         "Use /help to see all available commands.",
         parse_mode="Markdown",
     )
@@ -156,10 +210,13 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 HELP_TEXT = (
     "ℹ️ *Pump Detector – Help*\n\n"
     "This bot monitors all Bybit USDT perpetual futures and alerts you "
-    "when a coin pumps above your configured threshold within your chosen "
-    "time window.\n\n"
+    "when a coin pumps or dumps beyond your configured thresholds within "
+    "your chosen time windows.\n\n"
+    "*Alert examples:*\n"
+    "🟢Pump: PIPPIN: 36.32%\n"
+    "🔴Dump: PIPPIN: -28.50%\n\n"
     "*Commands:*\n"
-    "/start – Initial setup (scan frequency, threshold, time window)\n"
+    "/start – Initial setup (frequency, pump & dump settings)\n"
     "/param – Change your alert parameters\n"
     "/status – View your current settings\n"
     "/pause – Pause alerts\n"
@@ -186,9 +243,11 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     state = "⏸ Paused" if user["is_paused"] else "▶️ Active"
     await update.message.reply_text(
         f"📊 *Your Settings*\n\n"
-        f"📡 Scan frequency: *{user['scan_frequency']}s*\n"
+        f"📡 Scan frequency: *{user['scan_frequency']}s*\n\n"
         f"📈 Pump threshold: *{user['pump_threshold']}%*\n"
-        f"⏱ Time window: *{user['time_window']} min*\n"
+        f"⏱ Pump window: *{user['pump_time_window']} min*\n\n"
+        f"📉 Dump threshold: *{user['dump_threshold']}%*\n"
+        f"⏱ Dump window: *{user['dump_time_window']} min*\n\n"
         f"Status: *{state}*",
         parse_mode="Markdown",
     )
@@ -232,7 +291,7 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Conversation handler for /start and /param (same flow)
+    # Conversation handler for /start and /param (same 5-step flow)
     conv = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
@@ -242,8 +301,18 @@ def main() -> None:
             ASK_FREQUENCY: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ask_frequency)
             ],
-            ASK_THRESHOLD: [CallbackQueryHandler(ask_threshold, pattern=r"^thresh_")],
-            ASK_WINDOW: [CallbackQueryHandler(ask_window, pattern=r"^window_")],
+            ASK_PUMP_THRESHOLD: [
+                CallbackQueryHandler(ask_pump_threshold, pattern=r"^pthresh_")
+            ],
+            ASK_PUMP_WINDOW: [
+                CallbackQueryHandler(ask_pump_window, pattern=r"^pwindow_")
+            ],
+            ASK_DUMP_THRESHOLD: [
+                CallbackQueryHandler(ask_dump_threshold, pattern=r"^dthresh_")
+            ],
+            ASK_DUMP_WINDOW: [
+                CallbackQueryHandler(ask_dump_window, pattern=r"^dwindow_")
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         per_message=False,

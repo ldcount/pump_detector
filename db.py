@@ -15,33 +15,67 @@ def _conn() -> sqlite3.Connection:
 
 # ── Schema ────────────────────────────────────────────────
 
+
 def init_db() -> None:
     """Create tables and indices if they don't exist."""
     with _conn() as con:
-        con.execute("""
+        con.execute(
+            """
             CREATE TABLE IF NOT EXISTS price_log (
                 symbol    TEXT    NOT NULL,
                 price     REAL    NOT NULL,
                 timestamp REAL    NOT NULL
             )
-        """)
-        con.execute("""
+        """
+        )
+        con.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_price_log_sym_ts
             ON price_log (symbol, timestamp)
-        """)
-        con.execute("""
+        """
+        )
+        con.execute(
+            """
             CREATE TABLE IF NOT EXISTS user_settings (
-                user_id           INTEGER PRIMARY KEY,
-                scan_frequency    INTEGER DEFAULT 30,
-                pump_threshold    REAL    DEFAULT 10.0,
-                time_window       INTEGER DEFAULT 15,
-                is_paused         INTEGER DEFAULT 0,
-                is_setup_complete INTEGER DEFAULT 0
+                user_id            INTEGER PRIMARY KEY,
+                scan_frequency     INTEGER DEFAULT 30,
+                pump_threshold     REAL    DEFAULT 10.0,
+                pump_time_window   INTEGER DEFAULT 15,
+                dump_threshold     REAL    DEFAULT 10.0,
+                dump_time_window   INTEGER DEFAULT 15,
+                is_paused          INTEGER DEFAULT 0,
+                is_setup_complete  INTEGER DEFAULT 0
             )
-        """)
+        """
+        )
+
+        # ── Migrate old schema if needed ──────────────────
+        # Check existing columns
+        cols = {
+            row[1] for row in con.execute("PRAGMA table_info(user_settings)").fetchall()
+        }
+        migrations = {
+            "dump_threshold": "ALTER TABLE user_settings ADD COLUMN dump_threshold    REAL    DEFAULT 10.0",
+            "dump_time_window": "ALTER TABLE user_settings ADD COLUMN dump_time_window  INTEGER DEFAULT 15",
+            "pump_time_window": "ALTER TABLE user_settings ADD COLUMN pump_time_window  INTEGER DEFAULT 15",
+        }
+        for col, sql in migrations.items():
+            if col not in cols:
+                con.execute(sql)
+
+        # Rename old 'time_window' → copy value to 'pump_time_window' if it exists
+        if "time_window" in cols and "pump_time_window" in cols:
+            con.execute(
+                """
+                UPDATE user_settings
+                SET pump_time_window = time_window
+                WHERE pump_time_window = 15 AND time_window != 15
+            """
+            )
 
 
 # ── Price Log CRUD ────────────────────────────────────────
+
 
 def save_prices(prices: list[tuple[str, float]]) -> None:
     """Bulk-insert (symbol, price) rows with the current timestamp."""
@@ -94,6 +128,7 @@ def purge_old(hours: int = RETENTION_HOURS) -> int:
 
 
 # ── User Settings CRUD ───────────────────────────────────
+
 
 def upsert_user(user_id: int, **kwargs) -> None:
     """Insert or update user settings.  Pass only the columns to set."""
