@@ -45,6 +45,7 @@ def init_db() -> None:
                 dump_time_window   INTEGER DEFAULT 15,
                 cooldown_time      INTEGER DEFAULT 30,
                 is_paused          INTEGER DEFAULT 0,
+                paused_until_ts    REAL,
                 is_setup_complete  INTEGER DEFAULT 0
             )
         """
@@ -59,6 +60,16 @@ def init_db() -> None:
             )
         """
         )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS alert_cooldowns (
+                user_id       INTEGER NOT NULL,
+                symbol        TEXT    NOT NULL,
+                last_alert_ts REAL    NOT NULL,
+                PRIMARY KEY (user_id, symbol)
+            )
+        """
+        )
 
         # ── Migrate old schema if needed ──────────────────
         # Check existing columns
@@ -70,6 +81,7 @@ def init_db() -> None:
             "dump_time_window": "ALTER TABLE user_settings ADD COLUMN dump_time_window  INTEGER DEFAULT 15",
             "pump_time_window": "ALTER TABLE user_settings ADD COLUMN pump_time_window  INTEGER DEFAULT 15",
             "cooldown_time": "ALTER TABLE user_settings ADD COLUMN cooldown_time     INTEGER DEFAULT 30",
+            "paused_until_ts": "ALTER TABLE user_settings ADD COLUMN paused_until_ts  REAL",
         }
         for col, sql in migrations.items():
             if col not in cols:
@@ -169,11 +181,30 @@ def get_user(user_id: int) -> dict | None:
 
 def get_all_active_users() -> list[dict]:
     """Return all users where paused=0 and setup complete."""
+    now = time.time()
     with _conn() as con:
         rows = con.execute(
-            "SELECT * FROM user_settings WHERE is_paused = 0 AND is_setup_complete = 1"
+            """
+            SELECT *
+            FROM user_settings
+            WHERE is_setup_complete = 1
+              AND is_paused = 0
+              AND (paused_until_ts IS NULL OR paused_until_ts <= ?)
+            """,
+            (now,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_daily_alert_count(user_id: int) -> int:
+    """Return the current UTC-day alert count for a user."""
+    date_str = datetime.utcnow().strftime("%Y-%m-%d")
+    with _conn() as con:
+        row = con.execute(
+            "SELECT count FROM daily_alert_counts WHERE user_id = ? AND date_str = ?",
+            (user_id, date_str),
+        ).fetchone()
+    return row["count"] if row else 0
 
 
 def increment_and_get_daily_alert_count(user_id: int) -> int:
@@ -194,3 +225,46 @@ def increment_and_get_daily_alert_count(user_id: int) -> int:
         ).fetchone()
         con.commit()  # though using WAL with with-context, commit can be implicit, for ON CONFLICT it's good to be safe although python sqlite handles it
         return row["count"]
+
+
+def get_alert_cooldown_map(user_ids: list[int]) -> dict[tuple[int, str], float]:
+    """Return {(user_id, symbol): last_alert_ts} for the provided users."""
+    if not user_ids:
+        return {}
+
+    placeholders = ", ".join("?" for _ in user_ids)
+    with _conn() as con:
+        rows = con.execute(
+            f"""
+            SELECT user_id, symbol, last_alert_ts
+            FROM alert_cooldowns
+            WHERE user_id IN ({placeholders})
+            """,
+            user_ids,
+        ).fetchall()
+    return {(row["user_id"], row["symbol"]): row["last_alert_ts"] for row in rows}
+
+
+def set_alert_cooldown(user_id: int, symbol: str, last_alert_ts: float) -> None:
+    """Persist the last successful alert timestamp for a user and symbol."""
+    with _conn() as con:
+        con.execute(
+            """
+            INSERT INTO alert_cooldowns (user_id, symbol, last_alert_ts)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, symbol)
+            DO UPDATE SET last_alert_ts = excluded.last_alert_ts
+            """,
+            (user_id, symbol, last_alert_ts),
+        )
+
+
+def purge_old_cooldowns(hours: int = 24) -> int:
+    """Delete cooldown rows older than *hours*. Return deleted count."""
+    cutoff = time.time() - hours * 3600
+    with _conn() as con:
+        cur = con.execute(
+            "DELETE FROM alert_cooldowns WHERE last_alert_ts < ?",
+            (cutoff,),
+        )
+        return cur.rowcount

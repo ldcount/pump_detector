@@ -1,6 +1,8 @@
 """Pump Detector Telegram Bot – entry point."""
 
+import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 
 from telegram import (
     InlineKeyboardButton,
@@ -39,6 +41,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger("pump_detector")
 logger.setLevel(logging.INFO)
+
+PAUSE_1H = "pause_60"
+PAUSE_8H = "pause_480"
+PAUSE_TOMORROW = "pause_tomorrow"
+PAUSE_FOREVER = "pause_forever"
+
+
+def _format_pause_state(user: dict) -> str:
+    """Render the user's pause state for /status."""
+    if user["is_paused"]:
+        return "⏸ Paused until /resume"
+
+    paused_until_ts = user.get("paused_until_ts")
+    if paused_until_ts and paused_until_ts > datetime.now(timezone.utc).timestamp():
+        paused_until = datetime.fromtimestamp(paused_until_ts, tz=timezone.utc)
+        return f"⏸ Paused until {paused_until.strftime('%Y-%m-%d %H:%M UTC')}"
+
+    return "▶️ Active"
+
+
+def _pause_selection_to_deadline(selection: str) -> tuple[float, str]:
+    """Map a pause callback value to a UTC timestamp and label."""
+    now = datetime.now(timezone.utc)
+    if selection == PAUSE_1H:
+        return (now + timedelta(hours=1)).timestamp(), "1 hour"
+    if selection == PAUSE_8H:
+        return (now + timedelta(hours=8)).timestamp(), "8 hours"
+    if selection == PAUSE_TOMORROW:
+        tomorrow = datetime.combine(
+            (now + timedelta(days=1)).date(),
+            datetime.min.time(),
+            tzinfo=timezone.utc,
+        )
+        return tomorrow.timestamp(), "until tomorrow UTC"
+    raise ValueError(f"Unexpected pause selection: {selection}")
 
 
 # ── Conversation states ──────────────────────────────────
@@ -173,6 +210,7 @@ async def ask_cooldown(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         dump_time_window=dump_tw,
         cooldown_time=cooldown,
         is_paused=0,
+        paused_until_ts=None,
         is_setup_complete=1,
     )
 
@@ -212,7 +250,8 @@ HELP_TEXT = (
     "/start – Initial setup (pump & dump thresholds/windows & cooldown)\n"
     "/param – Change your alert parameters\n"
     "/status – View your current settings\n"
-    "/pause – Pause alerts\n"
+    "/testalert – Send yourself a sample alert\n"
+    "/pause – Pause alerts for 1h, 8h, until tomorrow, or until resume\n"
     "/resume – Resume alerts\n"
     "/help – Show this message\n"
 )
@@ -233,9 +272,12 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    state = "⏸ Paused" if user["is_paused"] else "▶️ Active"
+    state = _format_pause_state(user)
     await update.message.reply_text(
         f"📐 *Current Settings*\n\n"
+        f"📡 Scan interval: *{GLOBAL_TICK_INTERVAL}s*\n"
+        "💹 Price basis: *Bybit mark price*\n"
+        "🧠 Trigger logic: *current vs. lowest/highest price seen inside the selected window*\n\n"
         f"📈 Pump threshold: *{user['pump_threshold']}%*\n"
         f"⏱ Pump window: *{user['pump_time_window']} min*\n\n"
         f"📉 Dump threshold: *{user['dump_threshold']}%*\n"
@@ -250,17 +292,75 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def pause_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    db.upsert_user(uid, is_paused=1)
-    logger.info("User %s paused alerts", uid)
-    await update.message.reply_text("⏸ Alerts paused. Use /resume to restart.")
+    user = db.get_user(update.effective_user.id)
+    if not user or not user["is_setup_complete"]:
+        await update.message.reply_text(
+            "⚠️ You haven't set up the bot yet. Use /start to begin."
+        )
+        return
+
+    buttons = [
+        [
+            InlineKeyboardButton("1 hour", callback_data=PAUSE_1H),
+            InlineKeyboardButton("8 hours", callback_data=PAUSE_8H),
+        ],
+        [InlineKeyboardButton("Until tomorrow UTC", callback_data=PAUSE_TOMORROW)],
+        [InlineKeyboardButton("Until /resume", callback_data=PAUSE_FOREVER)],
+    ]
+    await update.message.reply_text(
+        "⏸ Choose how long to pause alerts:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def pause_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Apply a pause duration selected from the pause keyboard."""
+    query = update.callback_query
+    await query.answer()
+
+    uid = query.from_user.id
+    if query.data == PAUSE_FOREVER:
+        db.upsert_user(uid, is_paused=1, paused_until_ts=None)
+        logger.info("User %s paused alerts indefinitely", uid)
+        await query.edit_message_text("⏸ Alerts paused until you use /resume.")
+        return
+
+    paused_until_ts, label = _pause_selection_to_deadline(query.data)
+    db.upsert_user(uid, is_paused=0, paused_until_ts=paused_until_ts)
+    logger.info("User %s paused alerts until %s", uid, paused_until_ts)
+    await query.edit_message_text(f"⏸ Alerts paused for *{label}*.", parse_mode="Markdown")
 
 
 async def resume_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
-    db.upsert_user(uid, is_paused=0)
+    db.upsert_user(uid, is_paused=0, paused_until_ts=None)
     logger.info("User %s resumed alerts", uid)
     await update.message.reply_text("▶️ Alerts resumed!")
+
+
+async def testalert_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a sample alert using the user's current settings."""
+    user = db.get_user(update.effective_user.id)
+    if not user or not user["is_setup_complete"]:
+        await update.message.reply_text(
+            "⚠️ You haven't set up the bot yet. Use /start to begin."
+        )
+        return
+
+    pump_tw = user["pump_time_window"]
+    pump_threshold = user["pump_threshold"]
+    text = (
+        "🧪 *Sample alert*\n\n"
+        f"🏦[ByBit](https://www.bybit.com/trade/usdt/BTCUSDT) – {pump_tw}m – "
+        "[BTC](https://www.coinglass.com/tv/Bybit_BTCUSDT)\n"
+        f"🟢*Pump*: *{pump_threshold + 1:.2f}%*\n"
+        "#️⃣Signal 24h: sample"
+    )
+    await update.message.reply_text(
+        text,
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
 
 
 # ── Periodic job callback ───────────────────────────────
@@ -269,7 +369,7 @@ async def resume_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def tick(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Called every GLOBAL_TICK_INTERVAL seconds by the job queue."""
     await collector.collect_and_alert(ctx.bot)
-    collector.cleanup_cooldown_cache()
+    await asyncio.to_thread(collector.cleanup_cooldown_cache)
 
 
 # ── Main ─────────────────────────────────────────────────
@@ -312,8 +412,10 @@ def main() -> None:
     app.add_handler(conv)
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("testalert", testalert_cmd))
     app.add_handler(CommandHandler("pause", pause_cmd))
     app.add_handler(CommandHandler("resume", resume_cmd))
+    app.add_handler(CallbackQueryHandler(pause_select, pattern=r"^pause_"))
 
     # Schedule the global collector tick
     app.job_queue.run_repeating(
