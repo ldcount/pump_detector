@@ -21,6 +21,8 @@ import collector
 import db
 from config import (
     BOT_TOKEN,
+    COOLDOWN_TIMES,
+    DEFAULT_COOLDOWN_TIME,
     DEFAULT_DUMP_THRESHOLD,
     DEFAULT_DUMP_TIME_WINDOW,
     DEFAULT_PUMP_THRESHOLD,
@@ -48,7 +50,8 @@ logger.setLevel(logging.INFO)
     ASK_PUMP_WINDOW,
     ASK_DUMP_THRESHOLD,
     ASK_DUMP_WINDOW,
-) = range(5)
+    ASK_COOLDOWN,
+) = range(6)
 
 
 # ── /start & /param ─────────────────────────────────────
@@ -59,7 +62,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         "👋 Welcome to *Pump Detector*!\n\n"
         "Let's configure your alert settings.\n\n"
-        "📡 *Step 1/5 – Scan frequency*\n"
+        "📡 *Step 1/6 – Scan frequency*\n"
         "How often (in seconds) should market prices be checked?\n"
         f"Minimum is *{MIN_SCAN_FREQUENCY}* seconds.\n\n"
         "Type a number:",
@@ -90,7 +93,7 @@ async def ask_frequency(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         for t in THRESHOLDS
     ]
     await update.message.reply_text(
-        "📈 *Step 2/5 – Pump threshold*\n"
+        "📈 *Step 2/6 – Pump threshold*\n"
         "What minimum pump percentage should trigger an alert?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -111,7 +114,7 @@ async def ask_pump_threshold(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         for w in TIME_WINDOWS
     ]
     await query.edit_message_text(
-        "⏱ *Step 3/5 – Pump time window*\n"
+        "⏱ *Step 3/6 – Pump time window*\n"
         "Over how many minutes should the pump be measured?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -131,7 +134,7 @@ async def ask_pump_window(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         for t in THRESHOLDS
     ]
     await query.edit_message_text(
-        "📉 *Step 4/5 – Dump threshold*\n"
+        "📉 *Step 4/6 – Dump threshold*\n"
         "What minimum dump percentage should trigger an alert?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -152,7 +155,7 @@ async def ask_dump_threshold(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         for w in TIME_WINDOWS
     ]
     await query.edit_message_text(
-        "⏱ *Step 5/5 – Dump time window*\n"
+        "⏱ *Step 5/6 – Dump time window*\n"
         "Over how many minutes should the dump be measured?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -161,15 +164,36 @@ async def ask_dump_threshold(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def ask_dump_window(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive dump window, save all settings, finish setup."""
+    """Receive dump window and ask for cooldown time."""
     query = update.callback_query
     await query.answer()
 
-    dump_tw = int(query.data.split("_")[1])
+    ctx.user_data["dump_time_window"] = int(query.data.split("_")[1])
+
+    buttons = [
+        [InlineKeyboardButton(f"{w} min", callback_data=f"cooldown_{w}")]
+        for w in COOLDOWN_TIMES
+    ]
+    await query.edit_message_text(
+        "⏳ *Step 6/6 – Alert cooldown*\n"
+        "How many minutes should pass before receiving another alert for the same coin?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return ASK_COOLDOWN
+
+
+async def ask_cooldown(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive cooldown time, save all settings, finish setup."""
+    query = update.callback_query
+    await query.answer()
+
+    cooldown = int(query.data.split("_")[1])
     freq = ctx.user_data.get("scan_frequency", DEFAULT_SCAN_FREQUENCY)
     pump_thresh = ctx.user_data.get("pump_threshold", DEFAULT_PUMP_THRESHOLD)
     pump_tw = ctx.user_data.get("pump_time_window", DEFAULT_PUMP_TIME_WINDOW)
     dump_thresh = ctx.user_data.get("dump_threshold", DEFAULT_DUMP_THRESHOLD)
+    dump_tw = ctx.user_data.get("dump_time_window", DEFAULT_DUMP_TIME_WINDOW)
 
     user_id = query.from_user.id
     db.upsert_user(
@@ -179,6 +203,7 @@ async def ask_dump_window(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         pump_time_window=pump_tw,
         dump_threshold=dump_thresh,
         dump_time_window=dump_tw,
+        cooldown_time=cooldown,
         is_paused=0,
         is_setup_complete=1,
     )
@@ -190,6 +215,7 @@ async def ask_dump_window(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         f"⏱ Pump window: *{pump_tw} min*\n\n"
         f"📉 Dump threshold: *{dump_thresh}%*\n"
         f"⏱ Dump window: *{dump_tw} min*\n\n"
+        f"⏳ Cooldown time: *{cooldown} min*\n\n"
         "You will now receive alerts for pumps and dumps.\n"
         "Use /help to see all available commands.",
         parse_mode="Markdown",
@@ -248,6 +274,7 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"⏱ Pump window: *{user['pump_time_window']} min*\n\n"
         f"📉 Dump threshold: *{user['dump_threshold']}%*\n"
         f"⏱ Dump window: *{user['dump_time_window']} min*\n\n"
+        f"⏳ Cooldown time: *{user.get('cooldown_time', DEFAULT_COOLDOWN_TIME)} min*\n\n"
         f"Status: *{state}*",
         parse_mode="Markdown",
     )
@@ -313,6 +340,7 @@ def main() -> None:
             ASK_DUMP_WINDOW: [
                 CallbackQueryHandler(ask_dump_window, pattern=r"^dwindow_")
             ],
+            ASK_COOLDOWN: [CallbackQueryHandler(ask_cooldown, pattern=r"^cooldown_")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         per_message=False,

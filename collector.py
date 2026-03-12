@@ -7,14 +7,14 @@ from pybit.unified_trading import HTTP as BybitHTTP
 
 import db
 from config import (
-    ALERT_COOLDOWN_SECONDS,
     BYBIT_TRADE_URL,
+    COINGLASS_URL,
 )
 
 logger = logging.getLogger(__name__)
 
 # ── In-memory alert cooldown tracker ─────────────────────
-# Key: (user_id, symbol, time_window, direction)  →  last_alert_ts
+# Key: (user_id, symbol)  →  last_alert_ts
 _alert_cooldown: dict[tuple, float] = {}
 
 
@@ -128,15 +128,23 @@ async def _check_pumps(bot, user, change_results, now, uid):
     for symbol, data in changes.items():
         pct = data.get("pump", 0)
         if pct >= threshold:
-            key = (uid, symbol, tw, "pump")
+            key = (uid, symbol)
             last = _alert_cooldown.get(key, 0)
-            if now - last < ALERT_COOLDOWN_SECONDS:
+            cooldown_seconds = user.get("cooldown_time", 30) * 60
+            if now - last < cooldown_seconds:
                 continue
 
             _alert_cooldown[key] = now
             coin = symbol.replace("USDT", "")
-            url = BYBIT_TRADE_URL.format(symbol=symbol)
-            text = f"🟢Pump - {tw}m: [{coin}]({url}): {pct}%"
+            bybit_url = BYBIT_TRADE_URL.format(symbol=symbol)
+            coinglass_url = COINGLASS_URL.format(symbol=coin)
+            signal_count = db.increment_and_get_daily_alert_count(uid)
+
+            text = (
+                f"🏦[ByBit]({bybit_url}) – {tw}m – [{coin}]({coinglass_url})\n"
+                f"🟢*Pump*: *{pct}%*\n"
+                f"#️⃣Signal 24h: {signal_count}"
+            )
 
             try:
                 await bot.send_message(
@@ -159,15 +167,23 @@ async def _check_dumps(bot, user, change_results, now, uid):
         pct = data.get("dump", 0)
         # Dump = negative change whose absolute value exceeds the threshold
         if pct <= -threshold:
-            key = (uid, symbol, tw, "dump")
+            key = (uid, symbol)
             last = _alert_cooldown.get(key, 0)
-            if now - last < ALERT_COOLDOWN_SECONDS:
+            cooldown_seconds = user.get("cooldown_time", 30) * 60
+            if now - last < cooldown_seconds:
                 continue
 
             _alert_cooldown[key] = now
             coin = symbol.replace("USDT", "")
-            url = BYBIT_TRADE_URL.format(symbol=symbol)
-            text = f"🔴Dump - {tw}m: [{coin}]({url}): {pct}%"
+            bybit_url = BYBIT_TRADE_URL.format(symbol=symbol)
+            coinglass_url = COINGLASS_URL.format(symbol=coin)
+            signal_count = db.increment_and_get_daily_alert_count(uid)
+
+            text = (
+                f"🏦[ByBit]({bybit_url}) – {tw}m – [{coin}]({coinglass_url})\n"
+                f"🔴*Dump*: *{pct}%*\n"
+                f"#️⃣Signal 24h: {signal_count}"
+            )
 
             try:
                 await bot.send_message(
@@ -181,8 +197,8 @@ async def _check_dumps(bot, user, change_results, now, uid):
 
 
 def cleanup_cooldown_cache() -> None:
-    """Remove stale entries from the cooldown dict."""
-    cutoff = time.time() - ALERT_COOLDOWN_SECONDS * 2
+    """Remove stale entries from the cooldown dict (older than 24 hours)."""
+    cutoff = time.time() - 86400
     stale = [k for k, ts in _alert_cooldown.items() if ts < cutoff]
     for k in stale:
         del _alert_cooldown[k]

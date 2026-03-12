@@ -26,8 +26,10 @@ TIME_WINDOWS = [5, 10, 15, 20, 30, 40, 60]
 DEFAULT_PUMP_TIME_WINDOW = 15
 DEFAULT_DUMP_TIME_WINDOW = 15
 
-# ── Alert cooldown ───────────────────────────────────────
-ALERT_COOLDOWN_SECONDS = 300  # 5 min – suppress repeat alerts per user/symbol/window
+# ── Alert cooldown (minutes) ─────────────────────────────
+COOLDOWN_TIMES = [15, 30, 45, 60, 120, 240]
+DEFAULT_COOLDOWN_TIME = 30
 
-# ── Bybit URL template ──────────────────────────────────
+# ── URL templates ───────────────────────────────────────
 BYBIT_TRADE_URL = "https://www.bybit.com/trade/usdt/{symbol}"
+COINGLASS_URL = "https://www.coinglass.com/tv/Bybit_{symbol}"

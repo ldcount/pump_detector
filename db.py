@@ -2,6 +2,7 @@
 
 import sqlite3
 import time
+from datetime import datetime
 from config import DB_PATH, RETENTION_HOURS
 
 
@@ -43,8 +44,19 @@ def init_db() -> None:
                 pump_time_window   INTEGER DEFAULT 15,
                 dump_threshold     REAL    DEFAULT 10.0,
                 dump_time_window   INTEGER DEFAULT 15,
+                cooldown_time      INTEGER DEFAULT 30,
                 is_paused          INTEGER DEFAULT 0,
                 is_setup_complete  INTEGER DEFAULT 0
+            )
+        """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_alert_counts (
+                user_id   INTEGER,
+                date_str  TEXT,
+                count     INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, date_str)
             )
         """
         )
@@ -58,6 +70,7 @@ def init_db() -> None:
             "dump_threshold": "ALTER TABLE user_settings ADD COLUMN dump_threshold    REAL    DEFAULT 10.0",
             "dump_time_window": "ALTER TABLE user_settings ADD COLUMN dump_time_window  INTEGER DEFAULT 15",
             "pump_time_window": "ALTER TABLE user_settings ADD COLUMN pump_time_window  INTEGER DEFAULT 15",
+            "cooldown_time": "ALTER TABLE user_settings ADD COLUMN cooldown_time     INTEGER DEFAULT 30",
         }
         for col, sql in migrations.items():
             if col not in cols:
@@ -162,3 +175,23 @@ def get_all_active_users() -> list[dict]:
             "SELECT * FROM user_settings WHERE is_paused = 0 AND is_setup_complete = 1"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def increment_and_get_daily_alert_count(user_id: int) -> int:
+    """Increment and return the daily alert count for a user (UTC date)."""
+    date_str = datetime.utcnow().strftime("%Y-%m-%d")
+    with _conn() as con:
+        con.execute(
+            """
+            INSERT INTO daily_alert_counts (user_id, date_str, count)
+            VALUES (?, ?, 1)
+            ON CONFLICT(user_id, date_str) DO UPDATE SET count = count + 1
+            """,
+            (user_id, date_str),
+        )
+        row = con.execute(
+            "SELECT count FROM daily_alert_counts WHERE user_id = ? AND date_str = ?",
+            (user_id, date_str),
+        ).fetchone()
+        con.commit()  # though using WAL with with-context, commit can be implicit, for ON CONFLICT it's good to be safe although python sqlite handles it
+        return row["count"]
