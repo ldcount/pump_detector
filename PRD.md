@@ -11,15 +11,22 @@ A Python Telegram bot that monitors **all Bybit USDT-margined perpetual futures*
 ## Alert format
 
 ```
-🟢Pump - <time_window>m: <COIN_LINK>: <percentage>%
-🔴Dump - <time_window>m: <COIN_LINK>: <percentage>%
+🏦[ByBit](<bybit_url>) – <time_window>m – [<COIN>](<coinglass_url>)
+🟢*Pump*: *<percentage>%*
+#️⃣Signal 24h: <count>
+
+🏦[ByBit](<bybit_url>) – <time_window>m – [<COIN>](<coinglass_url>)
+🔴*Dump*: *<percentage>%*
+#️⃣Signal 24h: <count>
 ```
 
-- `<COIN_LINK>` is a clickable link to the symbol's Bybit perp trading page (no link preview).
+- `<bybit_url>` is a clickable link to the symbol's Bybit perp trading page (no link preview).
+- `<coinglass_url>` is a clickable link to the symbol's Coinglass Supercharts.
 - `<time_window>` reflects the user's configured pump or dump time window.
+- `<count>` reflects the user's total signals for the current UTC day.
 - Each qualifying symbol is sent as a separate message.
 
-## User parameters (per user, set via 5-step setup)
+## User parameters (per user, set via 6-step setup)
 
 | # | Parameter | Options | Default |
 |---|-----------|---------|---------|
@@ -28,12 +35,13 @@ A Python Telegram bot that monitors **all Bybit USDT-margined perpetual futures*
 | 3 | Pump time window (min) | 5, 10, 15, 20, 30, 40, 60 | 15 |
 | 4 | Dump threshold (%) | 10, 20, 30, 50, 80 | 10 |
 | 5 | Dump time window (min) | 5, 10, 15, 20, 30, 40, 60 | 15 |
+| 6 | Alert cooldown (min) | 15, 30, 45, 60, 120, 240 | 30 |
 
 ## Bot commands
 
 | Command | Description |
 |---------|-------------|
-| `/start` | 5-step initial setup (frequency → pump threshold → pump window → dump threshold → dump window) |
+| `/start` | 6-step initial setup (frequency → pump threshold → pump window → dump threshold → dump window → cooldown) |
 | `/param` | Re-configure all parameters (same flow as /start) |
 | `/status` | Display current settings |
 | `/pause` | Pause alerts for the user |
@@ -46,7 +54,8 @@ A Python Telegram bot that monitors **all Bybit USDT-margined perpetual futures*
 - **Formula:** `change_pct = (current_price / price_X_minutes_ago - 1) * 100`
 - **Alert condition:** pump if `change_pct >= pump_threshold`; dump if `change_pct <= -dump_threshold`.
 - **Architecture:** single global collector → compute price changes per symbol/window → fan-out alerts to matching users.
-- **Alert cooldown:** 5 minutes per user/symbol/direction to avoid duplicates.
+- **Alert cooldown:** User-configurable cooldown per user & symbol to avoid duplicates.
+- **Daily tracking:** Maintains a strict UTC-day based counting of `daily_alert_counts` per user.
 - **Storage:** SQLite (WAL mode). Price history retained for 72 hours, then purged.
 - **Logging:** errors, start/stop, pause/resume only.
 
