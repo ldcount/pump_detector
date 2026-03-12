@@ -316,7 +316,12 @@ def main() -> None:
     app.add_handler(CommandHandler("resume", resume_cmd))
 
     # Schedule the global collector tick
-    app.job_queue.run_repeating(tick, interval=GLOBAL_TICK_INTERVAL, first=5)
+    app.job_queue.run_repeating(
+        tick,
+        interval=GLOBAL_TICK_INTERVAL,
+        first=5,
+        job_kwargs={"max_instances": 1, "coalesce": True},
+    )
 
     logger.info("Bot starting – polling…")
     app.run_polling(drop_pending_updates=True)

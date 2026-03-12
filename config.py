@@ -13,6 +13,8 @@ RETENTION_HOURS = 4
 
 # ── Scan ──────────────────────────────────────────────────
 GLOBAL_TICK_INTERVAL = 5  # seconds – collector always runs at this pace
+BYBIT_HTTP_TIMEOUT = 4  # seconds – keep fetches inside the tick budget
+TELEGRAM_SEND_CONCURRENCY = 8
 
 # ── Thresholds (%) – same choices for pump & dump ────────
 THRESHOLDS = [10, 20, 30, 50, 80]

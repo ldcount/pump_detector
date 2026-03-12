@@ -1,14 +1,18 @@
 """Global Bybit price collector, pump/dump detection, and alert fan-out."""
 
+import asyncio
 import logging
 import time
+from dataclasses import dataclass
 
 from pybit.unified_trading import HTTP as BybitHTTP
 
 import db
 from config import (
     BYBIT_TRADE_URL,
+    BYBIT_HTTP_TIMEOUT,
     COINGLASS_URL,
+    TELEGRAM_SEND_CONCURRENCY,
 )
 
 logger = logging.getLogger(__name__)
@@ -16,11 +20,29 @@ logger = logging.getLogger(__name__)
 # ── In-memory alert cooldown tracker ─────────────────────
 # Key: (user_id, symbol)  →  last_alert_ts
 _alert_cooldown: dict[tuple, float] = {}
+_dispatch_tasks: set[asyncio.Task] = set()
+_send_semaphore: asyncio.Semaphore | None = None
 
 
 # ── Bybit helpers ────────────────────────────────────────
 
-_bybit = BybitHTTP()
+_bybit = BybitHTTP(timeout=BYBIT_HTTP_TIMEOUT)
+
+
+@dataclass(frozen=True, slots=True)
+class Alert:
+    """Outgoing Telegram alert."""
+
+    user_id: int
+    text: str
+
+
+def _get_send_semaphore() -> asyncio.Semaphore:
+    """Lazily create a shared limiter for outgoing Telegram sends."""
+    global _send_semaphore
+    if _send_semaphore is None:
+        _send_semaphore = asyncio.Semaphore(TELEGRAM_SEND_CONCURRENCY)
+    return _send_semaphore
 
 
 def fetch_mark_prices() -> list[tuple[str, float]]:
@@ -83,47 +105,53 @@ def compute_price_changes(
 
 async def collect_and_alert(bot) -> None:
     """Run one collection cycle: fetch prices → detect pumps/dumps → send alerts."""
-    prices = fetch_mark_prices()
+    prices = await asyncio.to_thread(fetch_mark_prices)
     if not prices:
         return
 
-    # 1. Store prices
-    db.save_prices(prices)
+    alerts = await asyncio.to_thread(_build_alert_batch, prices)
+    if not alerts:
+        return
 
-    # 2. Purge old data
+    task = asyncio.create_task(_dispatch_alerts(bot, alerts))
+    _dispatch_tasks.add(task)
+    task.add_done_callback(_dispatch_tasks.discard)
+
+
+def _build_alert_batch(prices: list[tuple[str, float]]) -> list[Alert]:
+    """Persist a fresh market snapshot and build all due alerts."""
+    db.save_prices(prices)
     db.purge_old()
 
     current_map = {sym: px for sym, px in prices}
-
-    # 3. Get active users
     users = db.get_all_active_users()
     if not users:
-        return
+        return []
 
-    # 4. Collect all distinct time windows (pump + dump)
     windows: set[int] = set()
-    for u in users:
-        windows.add(u["pump_time_window"])
-        windows.add(u["dump_time_window"])
+    for user in users:
+        windows.add(user["pump_time_window"])
+        windows.add(user["dump_time_window"])
 
-    # 5. Compute price changes per window
     change_results: dict[int, dict[str, dict[str, float]]] = {}
-    for w in windows:
-        change_results[w] = compute_price_changes(current_map, w)
+    for window in windows:
+        change_results[window] = compute_price_changes(current_map, window)
 
-    # 6. Fan-out alerts
     now = time.time()
+    alerts: list[Alert] = []
     for user in users:
         uid = user["user_id"]
-        await _check_pumps(bot, user, change_results, now, uid)
-        await _check_dumps(bot, user, change_results, now, uid)
+        alerts.extend(_collect_pump_alerts(user, change_results, now, uid))
+        alerts.extend(_collect_dump_alerts(user, change_results, now, uid))
+    return alerts
 
 
-async def _check_pumps(bot, user, change_results, now, uid):
-    """Send pump alerts for a single user."""
+def _collect_pump_alerts(user, change_results, now, uid) -> list[Alert]:
+    """Build pump alerts for a single user."""
     threshold = user["pump_threshold"]
     tw = user["pump_time_window"]
     changes = change_results.get(tw, {})
+    alerts: list[Alert] = []
 
     for symbol, data in changes.items():
         pct = data.get("pump", 0)
@@ -145,23 +173,16 @@ async def _check_pumps(bot, user, change_results, now, uid):
                 f"🟢*Pump*: *{pct}%*\n"
                 f"#️⃣Signal 24h: {signal_count}"
             )
-
-            try:
-                await bot.send_message(
-                    chat_id=uid,
-                    text=text,
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                logger.exception("Failed to send pump alert to user %s", uid)
+            alerts.append(Alert(user_id=uid, text=text))
+    return alerts
 
 
-async def _check_dumps(bot, user, change_results, now, uid):
-    """Send dump alerts for a single user."""
+def _collect_dump_alerts(user, change_results, now, uid) -> list[Alert]:
+    """Build dump alerts for a single user."""
     threshold = user["dump_threshold"]
     tw = user["dump_time_window"]
     changes = change_results.get(tw, {})
+    alerts: list[Alert] = []
 
     for symbol, data in changes.items():
         pct = data.get("dump", 0)
@@ -184,16 +205,28 @@ async def _check_dumps(bot, user, change_results, now, uid):
                 f"🔴*Dump*: *{pct}%*\n"
                 f"#️⃣Signal 24h: {signal_count}"
             )
+            alerts.append(Alert(user_id=uid, text=text))
+    return alerts
 
-            try:
-                await bot.send_message(
-                    chat_id=uid,
-                    text=text,
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                logger.exception("Failed to send dump alert to user %s", uid)
+
+async def _dispatch_alerts(bot, alerts: list[Alert]) -> None:
+    """Send all alerts concurrently without blocking the collection cycle."""
+    await asyncio.gather(*(_send_alert(bot, alert) for alert in alerts))
+
+
+async def _send_alert(bot, alert: Alert) -> None:
+    """Send a single alert under a shared rate limiter."""
+    semaphore = _get_send_semaphore()
+    async with semaphore:
+        try:
+            await bot.send_message(
+                chat_id=alert.user_id,
+                text=alert.text,
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            logger.exception("Failed to send alert to user %s", alert.user_id)
 
 
 def cleanup_cooldown_cache() -> None:
