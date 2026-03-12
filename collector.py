@@ -137,7 +137,7 @@ async def _check_pumps(bot, user, change_results, now, uid):
             _alert_cooldown[key] = now
             coin = symbol.replace("USDT", "")
             bybit_url = BYBIT_TRADE_URL.format(symbol=symbol)
-            coinglass_url = COINGLASS_URL.format(symbol=coin)
+            coinglass_url = COINGLASS_URL.format(symbol=symbol)
             signal_count = db.increment_and_get_daily_alert_count(uid)
 
             text = (
@@ -176,7 +176,7 @@ async def _check_dumps(bot, user, change_results, now, uid):
             _alert_cooldown[key] = now
             coin = symbol.replace("USDT", "")
             bybit_url = BYBIT_TRADE_URL.format(symbol=symbol)
-            coinglass_url = COINGLASS_URL.format(symbol=coin)
+            coinglass_url = COINGLASS_URL.format(symbol=symbol)
             signal_count = db.increment_and_get_daily_alert_count(uid)
 
             text = (
