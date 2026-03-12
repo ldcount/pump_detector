@@ -37,6 +37,14 @@ class Alert:
     text_prefix: str
 
 
+@dataclass(frozen=True, slots=True)
+class MarketMover:
+    """Top market pump result."""
+
+    symbol: str
+    pump_pct: float
+
+
 def _get_send_semaphore() -> asyncio.Semaphore:
     """Lazily create a shared limiter for outgoing Telegram sends."""
     global _send_semaphore
@@ -107,6 +115,28 @@ def compute_price_changes(
                 "dump": round(dump_pct, 2),
             }
     return changes
+
+
+def get_top_market_pumps(
+    time_window_minutes: int,
+    limit: int = 10,
+) -> list[MarketMover]:
+    """Return the top pumping symbols for the requested window."""
+    current_prices = db.get_latest_prices()
+    if not current_prices:
+        return []
+
+    changes = compute_price_changes(current_prices, time_window_minutes)
+    ranked = sorted(
+        (
+            MarketMover(symbol=symbol, pump_pct=data["pump"])
+            for symbol, data in changes.items()
+            if data["pump"] > 0
+        ),
+        key=lambda item: item.pump_pct,
+        reverse=True,
+    )
+    return ranked[:limit]
 
 
 # ── Alert fan-out ────────────────────────────────────────

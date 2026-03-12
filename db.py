@@ -142,6 +142,23 @@ def get_all_symbols_extremes_since(target_ts: float) -> dict[str, dict[str, floa
     return {r["symbol"]: {"min": r["min_price"], "max": r["max_price"]} for r in rows}
 
 
+def get_latest_prices() -> dict[str, float]:
+    """Return the latest saved price snapshot as {symbol: price}."""
+    with _conn() as con:
+        latest_ts_row = con.execute(
+            "SELECT MAX(timestamp) AS latest_ts FROM price_log"
+        ).fetchone()
+        latest_ts = latest_ts_row["latest_ts"] if latest_ts_row else None
+        if latest_ts is None:
+            return {}
+
+        rows = con.execute(
+            "SELECT symbol, price FROM price_log WHERE timestamp = ?",
+            (latest_ts,),
+        ).fetchall()
+    return {row["symbol"]: row["price"] for row in rows}
+
+
 def purge_old(hours: int = RETENTION_HOURS) -> int:
     """Delete price_log rows older than *hours*. Return deleted count."""
     cutoff = time.time() - hours * 3600

@@ -23,7 +23,9 @@ import collector
 import db
 from config import (
     BOT_TOKEN,
+    BYBIT_TRADE_URL,
     COOLDOWN_TIMES,
+    COINGLASS_URL,
     DEFAULT_COOLDOWN_TIME,
     DEFAULT_DUMP_THRESHOLD,
     DEFAULT_DUMP_TIME_WINDOW,
@@ -46,6 +48,8 @@ PAUSE_1H = "pause_60"
 PAUSE_8H = "pause_480"
 PAUSE_TOMORROW = "pause_tomorrow"
 PAUSE_FOREVER = "pause_forever"
+MARKET_CALLBACK_PREFIX = "market_"
+MARKET_DEFAULT_WINDOW = 15
 
 
 def _format_pause_state(user: dict) -> str:
@@ -76,6 +80,52 @@ def _pause_selection_to_deadline(selection: str) -> tuple[float, str]:
         )
         return tomorrow.timestamp(), "until tomorrow UTC"
     raise ValueError(f"Unexpected pause selection: {selection}")
+
+
+def _market_keyboard(current_window: int) -> InlineKeyboardMarkup | None:
+    """Build the inline keyboard for alternate market windows."""
+    buttons: list[InlineKeyboardButton] = []
+    for window, label in ((15, "15m"), (30, "30m"), (60, "1h")):
+        if window != current_window:
+            buttons.append(
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"{MARKET_CALLBACK_PREFIX}{window}",
+                )
+            )
+
+    if not buttons:
+        return None
+    return InlineKeyboardMarkup([buttons])
+
+
+def _format_market_message(window_minutes: int) -> str:
+    """Build the /market leaderboard message."""
+    movers = collector.get_top_market_pumps(window_minutes)
+    heading = (
+        f"📈 *Market Pulse*\n\n"
+        f"Top 10 Bybit USDT perps by pump over the last *{_format_window_label(window_minutes)}*."
+    )
+    if not movers:
+        return (
+            f"{heading}\n\n"
+            "Not enough price history is available yet. Try again in a few minutes."
+        )
+
+    lines = [heading, ""]
+    for index, mover in enumerate(movers, start=1):
+        coin = mover.symbol.replace("USDT", "")
+        bybit_url = BYBIT_TRADE_URL.format(symbol=mover.symbol)
+        coinglass_url = COINGLASS_URL.format(symbol=mover.symbol)
+        lines.append(
+            f"{index}. [${coin}]({coinglass_url}) • [Bybit]({bybit_url}) • *{mover.pump_pct}%*"
+        )
+    return "\n".join(lines)
+
+
+def _format_window_label(window_minutes: int) -> str:
+    """Render a market window in human-friendly form."""
+    return "1 hour" if window_minutes == 60 else f"{window_minutes} minutes"
 
 
 # ── Conversation states ──────────────────────────────────
@@ -250,6 +300,7 @@ HELP_TEXT = (
     "/start – Initial setup (pump & dump thresholds/windows & cooldown)\n"
     "/param – Change your alert parameters\n"
     "/status – View your current settings\n"
+    "/market – Show the strongest pumps over the default 15m window\n"
     "/testalert – Send yourself a sample alert\n"
     "/pause – Pause alerts for 1h, 8h, until tomorrow, or until resume\n"
     "/resume – Resume alerts\n"
@@ -285,6 +336,32 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"⏳ Cooldown time: *{user.get('cooldown_time', DEFAULT_COOLDOWN_TIME)} min*\n\n"
         f"Status: *{state}*",
         parse_mode="Markdown",
+    )
+
+
+async def market_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the current top pump leaderboard for the default market window."""
+    text = await asyncio.to_thread(_format_market_message, MARKET_DEFAULT_WINDOW)
+    await update.message.reply_text(
+        text,
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+        reply_markup=_market_keyboard(MARKET_DEFAULT_WINDOW),
+    )
+
+
+async def market_window_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a new market leaderboard message for the selected window."""
+    query = update.callback_query
+    await query.answer()
+
+    window_minutes = int(query.data.removeprefix(MARKET_CALLBACK_PREFIX))
+    text = await asyncio.to_thread(_format_market_message, window_minutes)
+    await query.message.reply_text(
+        text,
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+        reply_markup=_market_keyboard(window_minutes),
     )
 
 
@@ -411,11 +488,15 @@ def main() -> None:
 
     app.add_handler(conv)
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("market", market_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("testalert", testalert_cmd))
     app.add_handler(CommandHandler("pause", pause_cmd))
     app.add_handler(CommandHandler("resume", resume_cmd))
     app.add_handler(CallbackQueryHandler(pause_select, pattern=r"^pause_"))
+    app.add_handler(
+        CallbackQueryHandler(market_window_cmd, pattern=r"^market_(15|30|60)$")
+    )
 
     # Schedule the global collector tick
     app.job_queue.run_repeating(
