@@ -54,9 +54,10 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS daily_alert_counts (
                 user_id   INTEGER,
+                symbol    TEXT,
                 date_str  TEXT,
                 count     INTEGER DEFAULT 0,
-                PRIMARY KEY (user_id, date_str)
+                PRIMARY KEY (user_id, symbol, date_str)
             )
         """
         )
@@ -86,6 +87,24 @@ def init_db() -> None:
         for col, sql in migrations.items():
             if col not in cols:
                 con.execute(sql)
+
+        daily_cols = {
+            row[1] for row in con.execute("PRAGMA table_info(daily_alert_counts)").fetchall()
+        }
+        if "symbol" not in daily_cols:
+            con.execute("ALTER TABLE daily_alert_counts RENAME TO daily_alert_counts_legacy")
+            con.execute(
+                """
+                CREATE TABLE daily_alert_counts (
+                    user_id   INTEGER,
+                    symbol    TEXT,
+                    date_str  TEXT,
+                    count     INTEGER DEFAULT 0,
+                    PRIMARY KEY (user_id, symbol, date_str)
+                )
+            """
+            )
+            con.execute("DROP TABLE daily_alert_counts_legacy")
 
         # Rename old 'time_window' → copy value to 'pump_time_window' if it exists
         if "time_window" in cols and "pump_time_window" in cols:
@@ -213,32 +232,41 @@ def get_all_active_users() -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def get_daily_alert_count(user_id: int) -> int:
-    """Return the current UTC-day alert count for a user."""
+def get_daily_alert_count(user_id: int, symbol: str) -> int:
+    """Return the current UTC-day alert count for a user and symbol."""
     date_str = datetime.utcnow().strftime("%Y-%m-%d")
     with _conn() as con:
         row = con.execute(
-            "SELECT count FROM daily_alert_counts WHERE user_id = ? AND date_str = ?",
-            (user_id, date_str),
+            """
+            SELECT count
+            FROM daily_alert_counts
+            WHERE user_id = ? AND symbol = ? AND date_str = ?
+            """,
+            (user_id, symbol, date_str),
         ).fetchone()
     return row["count"] if row else 0
 
 
-def increment_and_get_daily_alert_count(user_id: int) -> int:
-    """Increment and return the daily alert count for a user (UTC date)."""
+def increment_and_get_daily_alert_count(user_id: int, symbol: str) -> int:
+    """Increment and return the daily alert count for a user and symbol (UTC date)."""
     date_str = datetime.utcnow().strftime("%Y-%m-%d")
     with _conn() as con:
         con.execute(
             """
-            INSERT INTO daily_alert_counts (user_id, date_str, count)
-            VALUES (?, ?, 1)
-            ON CONFLICT(user_id, date_str) DO UPDATE SET count = count + 1
+            INSERT INTO daily_alert_counts (user_id, symbol, date_str, count)
+            VALUES (?, ?, ?, 1)
+            ON CONFLICT(user_id, symbol, date_str)
+            DO UPDATE SET count = count + 1
             """,
-            (user_id, date_str),
+            (user_id, symbol, date_str),
         )
         row = con.execute(
-            "SELECT count FROM daily_alert_counts WHERE user_id = ? AND date_str = ?",
-            (user_id, date_str),
+            """
+            SELECT count
+            FROM daily_alert_counts
+            WHERE user_id = ? AND symbol = ? AND date_str = ?
+            """,
+            (user_id, symbol, date_str),
         ).fetchone()
         con.commit()  # though using WAL with with-context, commit can be implicit, for ON CONFLICT it's good to be safe although python sqlite handles it
         return row["count"]

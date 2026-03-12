@@ -258,13 +258,17 @@ async def _send_user_alerts(bot, user_id: int, alerts: list[Alert]) -> None:
     """Send a single user's alerts in order so counts stay accurate."""
     lock = _get_user_send_lock(user_id)
     async with lock:
-        current_count = await asyncio.to_thread(db.get_daily_alert_count, user_id)
+        current_counts: dict[str, int] = {}
         for alert in alerts:
-            next_count = current_count + 1
+            if alert.symbol not in current_counts:
+                current_counts[alert.symbol] = await asyncio.to_thread(
+                    db.get_daily_alert_count, user_id, alert.symbol
+                )
+            next_count = current_counts[alert.symbol] + 1
             text = f"{alert.text_prefix}\n#️⃣Signal 24h: {next_count}"
             if await _send_alert(bot, alert.user_id, text):
-                current_count = await asyncio.to_thread(
-                    db.increment_and_get_daily_alert_count, user_id
+                current_counts[alert.symbol] = await asyncio.to_thread(
+                    db.increment_and_get_daily_alert_count, user_id, alert.symbol
                 )
                 await asyncio.to_thread(
                     db.set_alert_cooldown, user_id, alert.symbol, time.time()
