@@ -9,12 +9,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 # ── Database ──────────────────────────────────────────────
 DB_PATH = "pump_detector.db"
-RETENTION_HOURS = 72
+RETENTION_HOURS = 4
 
 # ── Scan ──────────────────────────────────────────────────
-MIN_SCAN_FREQUENCY = 30  # seconds
-DEFAULT_SCAN_FREQUENCY = 30  # seconds
-GLOBAL_TICK_INTERVAL = 30  # seconds – collector always runs at this pace
+GLOBAL_TICK_INTERVAL = 5  # seconds – collector always runs at this pace
 
 # ── Thresholds (%) – same choices for pump & dump ────────
 THRESHOLDS = [10, 20, 30, 50, 80]

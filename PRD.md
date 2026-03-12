@@ -26,22 +26,21 @@ A Python Telegram bot that monitors **all Bybit USDT-margined perpetual futures*
 - `<count>` reflects the user's total signals for the current UTC day.
 - Each qualifying symbol is sent as a separate message.
 
-## User parameters (per user, set via 6-step setup)
+## User parameters (per user, set via 5-step setup)
 
 | # | Parameter | Options | Default |
 |---|-----------|---------|---------|
-| 1 | Scan frequency (seconds) | Any integer ≥ 30 | 30 |
-| 2 | Pump threshold (%) | 10, 20, 30, 50, 80 | 10 |
-| 3 | Pump time window (min) | 5, 10, 15, 20, 30, 40, 60 | 15 |
-| 4 | Dump threshold (%) | 10, 20, 30, 50, 80 | 10 |
-| 5 | Dump time window (min) | 5, 10, 15, 20, 30, 40, 60 | 15 |
-| 6 | Alert cooldown (min) | 15, 30, 45, 60, 120, 240 | 30 |
+| 1 | Pump threshold (%) | 10, 20, 30, 50, 80 | 10 |
+| 2 | Pump time window (min) | 5, 10, 15, 20, 30, 40, 60 | 15 |
+| 3 | Dump threshold (%) | 10, 20, 30, 50, 80 | 10 |
+| 4 | Dump time window (min) | 5, 10, 15, 20, 30, 40, 60 | 15 |
+| 5 | Alert cooldown (min) | 15, 30, 45, 60, 120, 240 | 30 |
 
 ## Bot commands
 
 | Command | Description |
 |---------|-------------|
-| `/start` | 6-step initial setup (frequency → pump threshold → pump window → dump threshold → dump window → cooldown) |
+| `/start` | 5-step initial setup (pump threshold → pump window → dump threshold → dump window → cooldown) |
 | `/param` | Re-configure all parameters (same flow as /start) |
 | `/status` | Display current settings |
 | `/pause` | Pause alerts for the user |

@@ -39,7 +39,6 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS user_settings (
                 user_id            INTEGER PRIMARY KEY,
-                scan_frequency     INTEGER DEFAULT 30,
                 pump_threshold     REAL    DEFAULT 10.0,
                 pump_time_window   INTEGER DEFAULT 15,
                 dump_threshold     REAL    DEFAULT 10.0,

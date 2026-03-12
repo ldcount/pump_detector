@@ -27,9 +27,7 @@ from config import (
     DEFAULT_DUMP_TIME_WINDOW,
     DEFAULT_PUMP_THRESHOLD,
     DEFAULT_PUMP_TIME_WINDOW,
-    DEFAULT_SCAN_FREQUENCY,
     GLOBAL_TICK_INTERVAL,
-    MIN_SCAN_FREQUENCY,
     THRESHOLDS,
     TIME_WINDOWS,
 )
@@ -45,55 +43,27 @@ logger.setLevel(logging.INFO)
 
 # ── Conversation states ──────────────────────────────────
 (
-    ASK_FREQUENCY,
     ASK_PUMP_THRESHOLD,
     ASK_PUMP_WINDOW,
     ASK_DUMP_THRESHOLD,
     ASK_DUMP_WINDOW,
     ASK_COOLDOWN,
-) = range(6)
+) = range(5)
 
 
 # ── /start & /param ─────────────────────────────────────
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    """Begin the setup flow – ask scan frequency."""
-    await update.message.reply_text(
-        "👋 Welcome to *Pump Detector*!\n\n"
-        "Let's configure your alert settings.\n\n"
-        "📡 *Step 1/6 – Scan frequency*\n"
-        "How often (in seconds) should market prices be checked?\n"
-        f"Minimum is *{MIN_SCAN_FREQUENCY}* seconds.\n\n"
-        "Type a number:",
-        parse_mode="Markdown",
-    )
-    return ASK_FREQUENCY
-
-
-async def ask_frequency(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive scan frequency and ask for pump threshold."""
-    text = update.message.text.strip()
-    try:
-        freq = int(text)
-    except ValueError:
-        await update.message.reply_text("❌ Please enter a valid whole number.")
-        return ASK_FREQUENCY
-
-    if freq < MIN_SCAN_FREQUENCY:
-        await update.message.reply_text(
-            f"❌ Minimum scan frequency is {MIN_SCAN_FREQUENCY} seconds. Try again."
-        )
-        return ASK_FREQUENCY
-
-    ctx.user_data["scan_frequency"] = freq
-
+    """Begin the setup flow – ask for pump threshold."""
     buttons = [
         [InlineKeyboardButton(f"{t}%", callback_data=f"pthresh_{t}")]
         for t in THRESHOLDS
     ]
     await update.message.reply_text(
-        "📈 *Step 2/6 – Pump threshold*\n"
+        "👋 Welcome to *Pump Detector*!\n\n"
+        "Let's configure your alert settings.\n\n"
+        "📈 *Step 1/5 – Pump threshold*\n"
         "What minimum pump percentage should trigger an alert?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -114,7 +84,7 @@ async def ask_pump_threshold(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         for w in TIME_WINDOWS
     ]
     await query.edit_message_text(
-        "⏱ *Step 3/6 – Pump time window*\n"
+        "⏱ *Step 2/5 – Pump time window*\n"
         "Over how many minutes should the pump be measured?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -134,7 +104,7 @@ async def ask_pump_window(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         for t in THRESHOLDS
     ]
     await query.edit_message_text(
-        "📉 *Step 4/6 – Dump threshold*\n"
+        "📉 *Step 3/5 – Dump threshold*\n"
         "What minimum dump percentage should trigger an alert?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -155,7 +125,7 @@ async def ask_dump_threshold(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         for w in TIME_WINDOWS
     ]
     await query.edit_message_text(
-        "⏱ *Step 5/6 – Dump time window*\n"
+        "⏱ *Step 4/5 – Dump time window*\n"
         "Over how many minutes should the dump be measured?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -175,7 +145,7 @@ async def ask_dump_window(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         for w in COOLDOWN_TIMES
     ]
     await query.edit_message_text(
-        "⏳ *Step 6/6 – Alert cooldown*\n"
+        "⏳ *Step 5/5 – Alert cooldown*\n"
         "How many minutes should pass before receiving another alert for the same coin?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -189,7 +159,6 @@ async def ask_cooldown(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await query.answer()
 
     cooldown = int(query.data.split("_")[1])
-    freq = ctx.user_data.get("scan_frequency", DEFAULT_SCAN_FREQUENCY)
     pump_thresh = ctx.user_data.get("pump_threshold", DEFAULT_PUMP_THRESHOLD)
     pump_tw = ctx.user_data.get("pump_time_window", DEFAULT_PUMP_TIME_WINDOW)
     dump_thresh = ctx.user_data.get("dump_threshold", DEFAULT_DUMP_THRESHOLD)
@@ -198,7 +167,6 @@ async def ask_cooldown(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = query.from_user.id
     db.upsert_user(
         user_id,
-        scan_frequency=freq,
         pump_threshold=pump_thresh,
         pump_time_window=pump_tw,
         dump_threshold=dump_thresh,
@@ -210,7 +178,6 @@ async def ask_cooldown(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
     await query.edit_message_text(
         "✅ *Setup complete!*\n\n"
-        f"📡 Scan frequency: *{freq}s*\n\n"
         f"📈 Pump threshold: *{pump_thresh}%*\n"
         f"⏱ Pump window: *{pump_tw} min*\n\n"
         f"📉 Dump threshold: *{dump_thresh}%*\n"
@@ -242,7 +209,7 @@ HELP_TEXT = (
     "🟢Pump: PIPPIN: 36.32%\n"
     "🔴Dump: PIPPIN: -28.50%\n\n"
     "*Commands:*\n"
-    "/start – Initial setup (frequency, pump & dump settings)\n"
+    "/start – Initial setup (pump & dump thresholds/windows & cooldown)\n"
     "/param – Change your alert parameters\n"
     "/status – View your current settings\n"
     "/pause – Pause alerts\n"
@@ -269,7 +236,6 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     state = "⏸ Paused" if user["is_paused"] else "▶️ Active"
     await update.message.reply_text(
         f"📐 *Current Settings*\n\n"
-        f"📡 Scan frequency: *{user['scan_frequency']}s*\n\n"
         f"📈 Pump threshold: *{user['pump_threshold']}%*\n"
         f"⏱ Pump window: *{user['pump_time_window']} min*\n\n"
         f"📉 Dump threshold: *{user['dump_threshold']}%*\n"
@@ -318,16 +284,13 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Conversation handler for /start and /param (same 5-step flow)
+    # Conversation handler for /start and /param (5-step flow)
     conv = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
             CommandHandler("param", start),
         ],
         states={
-            ASK_FREQUENCY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_frequency)
-            ],
             ASK_PUMP_THRESHOLD: [
                 CallbackQueryHandler(ask_pump_threshold, pattern=r"^pthresh_")
             ],
