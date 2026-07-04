@@ -297,7 +297,7 @@ HELP_TEXT = (
     "🟢Pump: PIPPIN: 36.32%\n"
     "🔴Dump: PIPPIN: -28.50%\n\n"
     "*Commands:*\n"
-    "/start – Initial setup (pump & dump thresholds/windows & cooldown)\n"
+    "/start – Initial setup (thresholds, time, cooldown)\n"
     "/param – Change your alert parameters\n"
     "/status – View your current settings\n"
     "/market – Show the strongest pumps over the default 15m window\n"
