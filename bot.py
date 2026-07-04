@@ -320,7 +320,7 @@ HELP_TEXT = (
     "/resume – Resume alerts\n"
     "/help – Show this message\n\n"
     "*Trading Commands (Admin Only):*\n"
-    "/start_trading – Configure Bybit futures short parameters and enable trading\n"
+    "/start_trading – Configure and enable trading\n"
     "/stop_trading – Stop bot trading activity (existing positions/orders remain active)\n"
     "/trading_status – View parameters, open positions and today's PnL\n"
 )
