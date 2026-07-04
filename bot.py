@@ -21,6 +21,7 @@ from telegram.ext import (
 
 import collector
 import db
+import trading
 from config import (
     BOT_TOKEN,
     BYBIT_TRADE_URL,
@@ -34,6 +35,13 @@ from config import (
     GLOBAL_TICK_INTERVAL,
     THRESHOLDS,
     TIME_WINDOWS,
+    ADMIN_TELEGRAM_ID,
+    OFFSETS,
+    SHORT_SIZES,
+    TP_SIZES,
+    ORDER_TTLS,
+    SL_SIZES,
+    MAX_POSITIONS_CHOICES,
 )
 
 # ── Logging (errors + lifecycle only) ────────────────────
@@ -135,7 +143,13 @@ def _format_window_label(window_minutes: int) -> str:
     ASK_DUMP_THRESHOLD,
     ASK_DUMP_WINDOW,
     ASK_COOLDOWN,
-) = range(5)
+    ASK_OFFSET,
+    ASK_SHORT_SIZE,
+    ASK_TP_SIZE,
+    ASK_ORDER_TTL,
+    ASK_SL_SIZE,
+    ASK_MAX_OPEN_POSITIONS,
+) = range(11)
 
 
 # ── /start & /param ─────────────────────────────────────
@@ -296,7 +310,7 @@ HELP_TEXT = (
     "*Alert examples:*\n"
     "🟢Pump: PIPPIN: 36.32%\n"
     "🔴Dump: PIPPIN: -28.50%\n\n"
-    "*Commands:*\n"
+    "*Alert Commands:*\n"
     "/start – Initial setup (thresholds, time, cooldown)\n"
     "/param – Change your alert parameters\n"
     "/status – View your current settings\n"
@@ -304,7 +318,11 @@ HELP_TEXT = (
     "/testalert – Send yourself a sample alert\n"
     "/pause – Pause alerts for 1h, 8h, until tomorrow, or until resume\n"
     "/resume – Resume alerts\n"
-    "/help – Show this message\n"
+    "/help – Show this message\n\n"
+    "*Trading Commands (Admin Only):*\n"
+    "/start_trading – Configure Bybit futures short parameters and enable trading\n"
+    "/stop_trading – Stop bot trading activity (existing positions/orders remain active)\n"
+    "/trading_status – View parameters, open positions and today's PnL\n"
 )
 
 
@@ -440,6 +458,232 @@ async def testalert_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+# ── Trading setup conversation callbacks ─────────────────
+
+async def start_trading(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Begin the trading setup flow – ask for OFFSET."""
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔ Access denied.")
+        return ConversationHandler.END
+
+    buttons = [
+        [InlineKeyboardButton(f"{o}%", callback_data=f"toffset_{o}")]
+        for o in OFFSETS
+    ]
+    await update.message.reply_text(
+        "💼 *Bybit Short Trading Setup*\n\n"
+        "📈 *Step 1/6 – OFFSET (Max Slippage)*\n"
+        "What maximum slippage (offset below trigger price) is acceptable?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return ASK_OFFSET
+
+
+async def ask_offset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    value = float(query.data.split("_")[1])
+    ctx.user_data["offset"] = value
+
+    buttons = [
+        [InlineKeyboardButton(f"{s} USDT", callback_data=f"tshortsize_{s}")]
+        for s in SHORT_SIZES
+    ]
+    await query.edit_message_text(
+        "💰 *Step 2/6 – SHORT_SIZE*\n"
+        "What notional size per trade (in USDT) should the bot open?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return ASK_SHORT_SIZE
+
+
+async def ask_short_size(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    value = float(query.data.split("_")[1])
+    ctx.user_data["short_size"] = value
+
+    buttons = [
+        [InlineKeyboardButton(f"{tp}%", callback_data=f"ttpsize_{tp}")]
+        for tp in TP_SIZES
+    ]
+    await query.edit_message_text(
+        "🎯 *Step 3/6 – TP_SIZE (Take Profit)*\n"
+        "What distance below the entry price should the Take Profit trigger?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return ASK_TP_SIZE
+
+
+async def ask_tp_size(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    value = float(query.data.split("_")[1])
+    ctx.user_data["tp_size"] = value
+
+    buttons = [
+        [InlineKeyboardButton(f"{t} min", callback_data=f"torderttl_{t}")]
+        for t in ORDER_TTLS
+    ]
+    await query.edit_message_text(
+        "⏳ *Step 4/6 – ORDER_TTL (Unfilled TTL)*\n"
+        "After how many minutes should an unfilled entry order be cancelled?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return ASK_ORDER_TTL
+
+
+async def ask_order_ttl(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    value = int(query.data.split("_")[1])
+    ctx.user_data["order_ttl"] = value
+
+    buttons = [
+        [InlineKeyboardButton(f"{sl}%", callback_data=f"tslsize_{sl}")]
+        for sl in SL_SIZES
+    ]
+    await query.edit_message_text(
+        "🛡 *Step 5/6 – SL_SIZE (Stop Loss)*\n"
+        "What distance above the entry price should the Stop Loss trigger?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return ASK_SL_SIZE
+
+
+async def ask_sl_size(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    value = float(query.data.split("_")[1])
+    ctx.user_data["sl_size"] = value
+
+    buttons = [
+        [InlineKeyboardButton(f"{m}", callback_data=f"tmaxpos_{m}")]
+        for m in MAX_POSITIONS_CHOICES
+    ]
+    await query.edit_message_text(
+        "📊 *Step 6/6 – MAX_OPEN_POSITIONS*\n"
+        "What is the maximum allowed open positions (bot + manual) on the account?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return ASK_MAX_OPEN_POSITIONS
+
+
+async def ask_max_open_positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    max_pos = int(query.data.split("_")[1])
+    offset = ctx.user_data.get("offset", 1.0)
+    short_size = ctx.user_data.get("short_size", 100.0)
+    tp_size = ctx.user_data.get("tp_size", 5.0)
+    order_ttl = ctx.user_data.get("order_ttl", 10)
+    sl_size = ctx.user_data.get("sl_size", 5.0)
+
+    user_id = query.from_user.id
+    db.upsert_user(
+        user_id,
+        offset=offset,
+        short_size=short_size,
+        tp_size=tp_size,
+        order_ttl=order_ttl,
+        sl_size=sl_size,
+        max_open_positions=max_pos,
+        trading_enabled=1,
+    )
+
+    await query.edit_message_text(
+        "✅ *Trading Configuration Saved & Enabled!*\n\n"
+        f"📐 Offset (Max Slippage): *{offset}%*\n"
+        f"💰 Short Notional Size: *{short_size} USDT*\n"
+        f"🎯 Take Profit (TP): *-{tp_size}%*\n"
+        f"⏳ Entry Order TTL: *{order_ttl} min*\n"
+        f"🛡 Stop Loss (SL): *+{sl_size}%*\n"
+        f"📊 Max Positions Cap: *{max_pos}*\n\n"
+        "The bot will now open short positions on Bybit when pump signals trigger.",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+
+async def cancel_trading_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Setup cancelled. Use /start_trading to try again.")
+    return ConversationHandler.END
+
+
+# ── Stop & Status Commands ──────────────────────────────
+
+async def stop_trading_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔ Access denied.")
+        return
+    
+    db.upsert_user(update.effective_user.id, trading_enabled=0)
+    await update.message.reply_text(
+        "⏸ *Trading Stopped*\n\n"
+        "New trades will not be opened. Pending orders and open positions stay active and continue to be monitored.",
+        parse_mode="Markdown"
+    )
+
+
+async def trading_status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔ Access denied.")
+        return
+
+    user = db.get_user(update.effective_user.id)
+    if not user:
+        await update.message.reply_text("⚠️ No configuration found. Use /start_trading to configure parameters.")
+        return
+
+    bot_positions = await asyncio.to_thread(trading.get_bot_positions_info)
+    today_pnl = await asyncio.to_thread(db.get_realized_pnl_today)
+
+    status_str = "🟢 Enabled" if user.get("trading_enabled") else "⏸ Disabled/Paused"
+    
+    params_str = (
+        f"📐 Offset (Max Slippage): *{user.get('offset', 1.0)}%*\n"
+        f"💰 Short Size: *{user.get('short_size', 100.0)} USDT*\n"
+        f"🎯 TP size: *{user.get('tp_size', 5.0)}%*\n"
+        f"⏳ Order TTL: *{user.get('order_ttl', 10)} min*\n"
+        f"🛡 SL size: *{user.get('sl_size', 5.0)}%*\n"
+        f"📊 Max Positions: *{user.get('max_open_positions', 5)}*"
+    )
+
+    pos_lines = []
+    if bot_positions:
+        for pos in bot_positions:
+            pnl_sign = "+" if pos["unrealised_pnl"] >= 0 else ""
+            coin = pos["symbol"].replace("USDT", "")
+            pos_lines.append(
+                f"• *{coin}* (Short): Size *{pos['size']}* | Entry: *{pos['avg_price']}* | Mark: *{pos['current_price']}*\n"
+                f"  Unrealised PnL: *{pnl_sign}{pos['unrealised_pnl']:.4f} USDT* (TP: {pos['tp_price']} | SL: {pos['sl_price']})"
+            )
+    else:
+        pos_lines.append("No active bot positions.")
+
+    pnl_sign = "+" if today_pnl >= 0 else ""
+    msg = (
+        f"📊 *Bybit Trading Status*\n\n"
+        f"Trading State: *{status_str}*\n\n"
+        f"⚙️ *Trading Parameters:*\n{params_str}\n\n"
+        f"💼 *Active Bot Positions:*\n" + "\n".join(pos_lines) + f"\n\n"
+        f"💰 *Realised PnL (Today UTC):* *{pnl_sign}{today_pnl:.4f} USDT*"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
 # ── Periodic job callback ───────────────────────────────
 
 
@@ -447,6 +691,7 @@ async def tick(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Called every GLOBAL_TICK_INTERVAL seconds by the job queue."""
     await collector.collect_and_alert(ctx.bot)
     await asyncio.to_thread(collector.cleanup_cooldown_cache)
+    await trading.manage_active_trades(ctx.bot)
 
 
 # ── Main ─────────────────────────────────────────────────
@@ -459,7 +704,12 @@ def main() -> None:
     db.init_db()
     logger.info("Database initialised")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    async def post_init(application: Application) -> None:
+        logger.info("Running startup trade reconciliation...")
+        await trading.manage_active_trades(application.bot)
+        logger.info("Startup trade reconciliation complete.")
+
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     # Conversation handler for /start and /param (5-step flow)
     conv = ConversationHandler(
@@ -487,6 +737,38 @@ def main() -> None:
     )
 
     app.add_handler(conv)
+
+    trading_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("start_trading", start_trading),
+        ],
+        states={
+            ASK_OFFSET: [
+                CallbackQueryHandler(ask_offset, pattern=r"^toffset_")
+            ],
+            ASK_SHORT_SIZE: [
+                CallbackQueryHandler(ask_short_size, pattern=r"^tshortsize_")
+            ],
+            ASK_TP_SIZE: [
+                CallbackQueryHandler(ask_tp_size, pattern=r"^ttpsize_")
+            ],
+            ASK_ORDER_TTL: [
+                CallbackQueryHandler(ask_order_ttl, pattern=r"^torderttl_")
+            ],
+            ASK_SL_SIZE: [
+                CallbackQueryHandler(ask_sl_size, pattern=r"^tslsize_")
+            ],
+            ASK_MAX_OPEN_POSITIONS: [
+                CallbackQueryHandler(ask_max_open_positions, pattern=r"^tmaxpos_")
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_trading_setup)],
+        per_message=False,
+    )
+    app.add_handler(trading_conv)
+    app.add_handler(CommandHandler("stop_trading", stop_trading_cmd))
+    app.add_handler(CommandHandler("trading_status", trading_status_cmd))
+
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("market", market_cmd))
     app.add_handler(CommandHandler("status", status_cmd))

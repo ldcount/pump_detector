@@ -9,7 +9,9 @@ from dataclasses import dataclass
 from pybit.unified_trading import HTTP as BybitHTTP
 
 import db
+import trading
 from config import (
+    ADMIN_TELEGRAM_ID,
     BYBIT_TRADE_URL,
     BYBIT_HTTP_TIMEOUT,
     COINGLASS_URL,
@@ -35,6 +37,7 @@ class Alert:
     user_id: int
     symbol: str
     text_prefix: str
+    alert_type: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,7 +212,7 @@ def _collect_pump_alerts(user, change_results, now, uid, cooldown_map) -> list[A
                 f"🏦[ByBit]({bybit_url}) – {tw}m – [{coin}]({coinglass_url})\n"
                 f"🟢*Pump*: *{pct}%*"
             )
-            alerts.append(Alert(user_id=uid, symbol=symbol, text_prefix=text_prefix))
+            alerts.append(Alert(user_id=uid, symbol=symbol, text_prefix=text_prefix, alert_type="pump"))
     return alerts
 
 
@@ -237,7 +240,7 @@ def _collect_dump_alerts(user, change_results, now, uid, cooldown_map) -> list[A
                 f"🏦[ByBit]({bybit_url}) – {tw}m – [{coin}]({coinglass_url})\n"
                 f"🔴*Dump*: *{pct}%*"
             )
-            alerts.append(Alert(user_id=uid, symbol=symbol, text_prefix=text_prefix))
+            alerts.append(Alert(user_id=uid, symbol=symbol, text_prefix=text_prefix, alert_type="dump"))
     return alerts
 
 
@@ -273,6 +276,12 @@ async def _send_user_alerts(bot, user_id: int, alerts: list[Alert]) -> None:
                 await asyncio.to_thread(
                     db.set_alert_cooldown, user_id, alert.symbol, time.time()
                 )
+                # Trigger trading for admin if it's a pump alert
+                if user_id == ADMIN_TELEGRAM_ID and alert.alert_type == "pump":
+                    latest_prices = await asyncio.to_thread(db.get_latest_prices)
+                    trigger_price = latest_prices.get(alert.symbol)
+                    if trigger_price:
+                        asyncio.create_task(trading.try_open_trade(bot, alert.symbol, trigger_price))
 
 
 async def _send_alert(bot, user_id: int, text: str) -> bool:

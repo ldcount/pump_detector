@@ -33,3 +33,14 @@ DEFAULT_COOLDOWN_TIME = 30
 # ── URL templates ───────────────────────────────────────
 BYBIT_TRADE_URL = "https://www.bybit.com/trade/usdt/{symbol}"
 COINGLASS_URL = "https://www.coinglass.com/tv/Bybit_{symbol}"
+
+# ── Trading Configuration ────────────────────────────────
+ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID")) if os.getenv("ADMIN_TELEGRAM_ID") else None
+
+OFFSETS = [0, 1, 2, 3]
+SHORT_SIZES = [100, 200, 300, 400, 500]
+TP_SIZES = [3, 5, 7, 10, 15]
+ORDER_TTLS = [10, 15, 30, 60, 180]
+SL_SIZES = [5, 7, 10, 15]
+MAX_POSITIONS_CHOICES = [5, 10, 20]
+

@@ -71,6 +71,24 @@ def init_db() -> None:
             )
         """
         )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trades (
+                symbol            TEXT    NOT NULL,
+                trigger_price     REAL    NOT NULL,
+                timestamp         REAL    NOT NULL,
+                order_link_id     TEXT    PRIMARY KEY,
+                order_id          TEXT,
+                entry_price       REAL,
+                tp_price          REAL,
+                sl_price          REAL,
+                qty               REAL,
+                status            TEXT    NOT NULL,
+                realized_pnl      REAL    DEFAULT 0.0,
+                closed_timestamp  REAL
+            )
+        """
+        )
 
         # ── Migrate old schema if needed ──────────────────
         # Check existing columns
@@ -83,6 +101,13 @@ def init_db() -> None:
             "pump_time_window": "ALTER TABLE user_settings ADD COLUMN pump_time_window  INTEGER DEFAULT 15",
             "cooldown_time": "ALTER TABLE user_settings ADD COLUMN cooldown_time     INTEGER DEFAULT 30",
             "paused_until_ts": "ALTER TABLE user_settings ADD COLUMN paused_until_ts  REAL",
+            "trading_enabled": "ALTER TABLE user_settings ADD COLUMN trading_enabled   INTEGER DEFAULT 0",
+            "offset": "ALTER TABLE user_settings ADD COLUMN offset            REAL    DEFAULT 1.0",
+            "short_size": "ALTER TABLE user_settings ADD COLUMN short_size        REAL    DEFAULT 100.0",
+            "tp_size": "ALTER TABLE user_settings ADD COLUMN tp_size           REAL    DEFAULT 5.0",
+            "order_ttl": "ALTER TABLE user_settings ADD COLUMN order_ttl         INTEGER DEFAULT 10",
+            "sl_size": "ALTER TABLE user_settings ADD COLUMN sl_size           REAL    DEFAULT 5.0",
+            "max_open_positions": "ALTER TABLE user_settings ADD COLUMN max_open_positions INTEGER DEFAULT 5",
         }
         for col, sql in migrations.items():
             if col not in cols:
@@ -313,3 +338,74 @@ def purge_old_cooldowns(hours: int = 24) -> int:
             (cutoff,),
         )
         return cur.rowcount
+
+
+# ── Trades CRUD ───────────────────────────────────────────
+
+
+def create_trade(
+    symbol: str,
+    trigger_price: float,
+    timestamp: float,
+    order_link_id: str,
+    qty: float,
+    status: str,
+    tp_price: float,
+    sl_price: float,
+) -> None:
+    """Insert a new trade into the trades table."""
+    with _conn() as con:
+        con.execute(
+            """
+            INSERT INTO trades (
+                symbol, trigger_price, timestamp, order_link_id, qty, status, tp_price, sl_price
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (symbol, trigger_price, timestamp, order_link_id, qty, status, tp_price, sl_price),
+        )
+
+
+def update_trade(order_link_id: str, **kwargs) -> None:
+    """Update dynamic fields of a trade."""
+    if not kwargs:
+        return
+    sets = ", ".join(f"{k} = ?" for k in kwargs)
+    vals = list(kwargs.values()) + [order_link_id]
+    with _conn() as con:
+        con.execute(
+            f"UPDATE trades SET {sets} WHERE order_link_id = ?",
+            vals,
+        )
+
+
+def get_trade(order_link_id: str) -> dict | None:
+    """Retrieve a trade by its orderLinkId."""
+    with _conn() as con:
+        row = con.execute(
+            "SELECT * FROM trades WHERE order_link_id = ?",
+            (order_link_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_active_trades() -> list[dict]:
+    """Retrieve all pending or open trades."""
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT * FROM trades WHERE status IN ('pending', 'open')"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_realized_pnl_today() -> float:
+    """Retrieve sum of realized PnL for trades closed since today UTC."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    start_of_day = datetime(now.year, now.month, now.day, tzinfo=timezone.utc).timestamp()
+    with _conn() as con:
+        row = con.execute(
+            "SELECT SUM(realized_pnl) AS total_pnl FROM trades WHERE closed_timestamp >= ?",
+            (start_of_day,),
+        ).fetchone()
+    return row["total_pnl"] if row and row["total_pnl"] is not None else 0.0
+
