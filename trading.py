@@ -103,6 +103,7 @@ async def try_open_trade(bot, symbol: str, trigger_price: float) -> None:
         qty_step = float(symbol_info["lotSizeFilter"]["qtyStep"])
         min_qty = float(symbol_info["lotSizeFilter"]["minOrderQty"])
         min_notional = float(symbol_info["lotSizeFilter"].get("minNotionalValue", 5.0))
+        max_leverage = float(symbol_info["leverageFilter"]["maxLeverage"])
     except Exception as e:
         logger.exception("Error fetching instrument info for %s", symbol)
         await bot.send_message(
@@ -170,13 +171,17 @@ async def try_open_trade(bot, symbol: str, trigger_price: float) -> None:
         return
 
     # 8. Configure Leverage & Position mode on Bybit
+    # Symbols cap leverage individually (small caps often allow only 5x or less),
+    # so clamp the desired 10x to the symbol's maximum.
+    leverage = min(10.0, max_leverage)
+    leverage_str = f"{leverage:g}"
     try:
         try:
             session.set_leverage(
                 category="linear",
                 symbol=symbol,
-                buyLeverage="10",
-                sellLeverage="10",
+                buyLeverage=leverage_str,
+                sellLeverage=leverage_str,
             )
         except InvalidRequestError as le:
             if le.status_code != 110043 and "leverage not modified" not in str(le):
