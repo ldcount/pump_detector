@@ -1,8 +1,20 @@
+"""Bybit trade execution – open shorts on pump signals, manage active trades.
+
+All Bybit/DB work happens in synchronous bodies (`_try_open_trade_sync`,
+`_manage_active_trades_sync`) that return Notification lists. The async
+wrappers run them in a worker thread via asyncio.to_thread so the event loop
+(Telegram polling, the collector tick) is never blocked by HTTP calls.
+"""
+
+import asyncio
 import logging
 import os
 import time
+from dataclasses import dataclass
+
 from pybit.unified_trading import HTTP
 from pybit.exceptions import InvalidRequestError
+
 import db
 import config
 
@@ -10,12 +22,26 @@ logger = logging.getLogger(__name__)
 
 _session = None
 
+
+@dataclass(frozen=True, slots=True)
+class Notification:
+    """Telegram message produced by the sync trading logic."""
+
+    text: str
+    parse_mode: str | None = None
+
+
 def get_session():
     global _session
     if _session is None:
         api_key = os.getenv("BYBIT_API_KEY")
         api_secret = os.getenv("BYBIT_API_SECRET")
-        _session = HTTP(testnet=False, api_key=api_key, api_secret=api_secret)
+        _session = HTTP(
+            testnet=False,
+            api_key=api_key,
+            api_secret=api_secret,
+            timeout=config.TRADING_HTTP_TIMEOUT,
+        )
     return _session
 
 def get_decimal_places(step: float) -> int:
@@ -28,74 +54,85 @@ def round_step(val: float, step: float) -> float:
     decimals = get_decimal_places(step)
     return round(round(val / step) * step, decimals)
 
+
+async def _send_notifications(bot, admin_id: int, notifications: list[Notification]) -> None:
+    """Deliver the notifications produced by a sync trading body."""
+    for note in notifications:
+        try:
+            await bot.send_message(
+                chat_id=admin_id, text=note.text, parse_mode=note.parse_mode
+            )
+        except Exception:
+            logger.exception("Failed to send trading notification to admin")
+
+
 async def try_open_trade(bot, symbol: str, trigger_price: float) -> None:
-    # 1. Check if admin ID is set
+    """Open a short for a pump signal without blocking the event loop."""
     admin_id = config.ADMIN_TELEGRAM_ID
     if not admin_id:
         logger.error("ADMIN_TELEGRAM_ID is not set in config/env")
         return
 
-    # 2. Get admin user settings
+    notifications = await asyncio.to_thread(
+        _try_open_trade_sync, admin_id, symbol, trigger_price
+    )
+    await _send_notifications(bot, admin_id, notifications)
+
+
+def _try_open_trade_sync(admin_id: int, symbol: str, trigger_price: float) -> list[Notification]:
+    notes: list[Notification] = []
+
+    # 1. Get admin user settings
     admin_settings = db.get_user(admin_id)
     if not admin_settings or not admin_settings.get("is_setup_complete"):
-        return
+        return notes
 
-    # 3. Check if trading is enabled and not paused
+    # 2. Check if trading is enabled and not paused
     if not admin_settings.get("trading_enabled"):
-        return
+        return notes
 
     is_paused = admin_settings.get("is_paused", 0)
     paused_until_ts = admin_settings.get("paused_until_ts")
     if is_paused or (paused_until_ts and paused_until_ts > time.time()):
-        return
+        return notes
 
-    # 4. Check position constraints
+    # 3. Check position constraints
     try:
         session = get_session()
         pos_res = session.get_positions(category="linear", settleCoin="USDT")
         positions = pos_res.get("result", {}).get("list", [])
-        
+
         # Count all open positions in the linear perps account (both bot and manual)
         open_positions = [p for p in positions if float(p.get("size", 0)) > 0]
         total_open_count = len(open_positions)
-        
+
         # Check if symbol has an open position
         has_pos = any(p["symbol"] == symbol for p in open_positions)
         if has_pos:
-            await bot.send_message(
-                chat_id=admin_id,
-                text=f"⚠️ [Trade Skipped] Position already exists for {symbol}."
-            )
-            return
+            notes.append(Notification(f"⚠️ [Trade Skipped] Position already exists for {symbol}."))
+            return notes
 
         # Check if there is an active pending entry order for this symbol
         orders_res = session.get_open_orders(category="linear", symbol=symbol)
         open_orders = [o for o in orders_res.get("result", {}).get("list", []) if o.get("orderStatus") in ("New", "PartiallyFilled")]
         if open_orders:
-            await bot.send_message(
-                chat_id=admin_id,
-                text=f"⚠️ [Trade Skipped] Active pending order already exists for {symbol}."
-            )
-            return
-            
+            notes.append(Notification(f"⚠️ [Trade Skipped] Active pending order already exists for {symbol}."))
+            return notes
+
         # Check max open positions cap
         max_pos_cap = admin_settings.get("max_open_positions", 5)
         if total_open_count >= max_pos_cap:
-            await bot.send_message(
-                chat_id=admin_id,
-                text=f"⚠️ [Trade Skipped] Max open positions cap ({max_pos_cap}) reached. Current positions: {total_open_count}."
-            )
-            return
+            notes.append(Notification(
+                f"⚠️ [Trade Skipped] Max open positions cap ({max_pos_cap}) reached. Current positions: {total_open_count}."
+            ))
+            return notes
 
     except Exception as e:
         logger.exception("Error checking Bybit positions/orders before opening trade")
-        await bot.send_message(
-            chat_id=admin_id,
-            text=f"❌ [Trade Error] Failed to check Bybit status: {str(e)}"
-        )
-        return
+        notes.append(Notification(f"❌ [Trade Error] Failed to check Bybit status: {str(e)}"))
+        return notes
 
-    # 5. Fetch symbol constraints
+    # 4. Fetch symbol constraints
     try:
         instr = session.get_instruments_info(category="linear", symbol=symbol)
         symbol_info = instr["result"]["list"][0]
@@ -106,13 +143,10 @@ async def try_open_trade(bot, symbol: str, trigger_price: float) -> None:
         max_leverage = float(symbol_info["leverageFilter"]["maxLeverage"])
     except Exception as e:
         logger.exception("Error fetching instrument info for %s", symbol)
-        await bot.send_message(
-            chat_id=admin_id,
-            text=f"❌ [Trade Error] Failed to fetch instrument info for {symbol}: {str(e)}"
-        )
-        return
+        notes.append(Notification(f"❌ [Trade Error] Failed to fetch instrument info for {symbol}: {str(e)}"))
+        return notes
 
-    # 6. Calculate trade parameters
+    # 5. Calculate trade parameters
     offset_pct = admin_settings.get("offset", 1.0)
     short_size_usdt = admin_settings.get("short_size", 100.0)
     tp_pct = admin_settings.get("tp_size", 5.0)
@@ -126,13 +160,12 @@ async def try_open_trade(bot, symbol: str, trigger_price: float) -> None:
 
     notional = qty * limit_price
     if qty < min_qty or notional < min_notional:
-        msg = (
+        notes.append(Notification(
             f"⚠️ [Trade Skipped] Trade size too small for {symbol}.\n"
             f"Calculated Qty: {qty} (min: {min_qty})\n"
             f"Calculated Notional: {notional:.2f} USDT (min: {min_notional} USDT)"
-        )
-        await bot.send_message(chat_id=admin_id, text=msg)
-        return
+        ))
+        return notes
 
     tp_price = limit_price * (1 - tp_pct / 100.0)
     sl_price = limit_price * (1 + sl_pct / 100.0)
@@ -150,7 +183,7 @@ async def try_open_trade(bot, symbol: str, trigger_price: float) -> None:
     tp_str = f"{tp_price:.{price_dec}f}"
     sl_str = f"{sl_price:.{price_dec}f}"
 
-    # 7. Persist trade record as 'pending'
+    # 6. Persist trade record as 'pending'
     try:
         db.create_trade(
             symbol=symbol,
@@ -164,13 +197,10 @@ async def try_open_trade(bot, symbol: str, trigger_price: float) -> None:
         )
     except Exception as e:
         logger.exception("Error saving pending trade to database")
-        await bot.send_message(
-            chat_id=admin_id,
-            text=f"❌ [Trade Error] Database write failed for {symbol}: {str(e)}"
-        )
-        return
+        notes.append(Notification(f"❌ [Trade Error] Database write failed for {symbol}: {str(e)}"))
+        return notes
 
-    # 8. Configure Leverage & Position mode on Bybit
+    # 7. Configure Leverage & Position mode on Bybit
     # Symbols cap leverage individually (small caps often allow only 5x or less),
     # so clamp the desired 10x to the symbol's maximum.
     leverage = min(10.0, max_leverage)
@@ -186,7 +216,7 @@ async def try_open_trade(bot, symbol: str, trigger_price: float) -> None:
         except InvalidRequestError as le:
             if le.status_code != 110043 and "leverage not modified" not in str(le):
                 raise le
-        
+
         try:
             session.switch_position_mode(
                 category="linear",
@@ -199,13 +229,10 @@ async def try_open_trade(bot, symbol: str, trigger_price: float) -> None:
     except Exception as e:
         logger.exception("Error setting leverage/position mode for %s", symbol)
         db.update_trade(order_link_id, status="error")
-        await bot.send_message(
-            chat_id=admin_id,
-            text=f"❌ [Trade Error] Failed to set leverage/position mode for {symbol}: {str(e)}"
-        )
-        return
+        notes.append(Notification(f"❌ [Trade Error] Failed to set leverage/position mode for {symbol}: {str(e)}"))
+        return notes
 
-    # 9. Place Order
+    # 8. Place Order
     try:
         res = session.place_order(
             category="linear",
@@ -223,50 +250,58 @@ async def try_open_trade(bot, symbol: str, trigger_price: float) -> None:
             slTriggerBy="MarkPrice",
         )
         order_id = res["result"]["orderId"]
-        
+
         db.update_trade(order_link_id, order_id=order_id)
-        
-        msg = (
+
+        notes.append(Notification(
             f"🚀 *Short Order Placed*\n\n"
             f"🪙 Symbol: *{symbol.replace('USDT', '')}*\n"
             f"📉 Limit Price: *{price_str} USDT*\n"
             f"💰 Qty: *{qty_str}* (Notional ~{notional:.2f} USDT)\n"
             f"🎯 TP: *{tp_str} USDT* (-{tp_pct}%)\n"
             f"🛡 SL: *{sl_str} USDT* (+{sl_pct}%)\n"
-            f"🔗 ID: `{order_id}`"
-        )
-        await bot.send_message(chat_id=admin_id, text=msg, parse_mode="Markdown")
-        
+            f"🔗 ID: `{order_id}`",
+            parse_mode="Markdown",
+        ))
+
     except Exception as e:
         logger.exception("Error placing Bybit order for %s", symbol)
         db.update_trade(order_link_id, status="error")
-        await bot.send_message(
-            chat_id=admin_id,
-            text=f"❌ [Trade Error] Failed to place order for {symbol}: {str(e)}"
-        )
+        notes.append(Notification(f"❌ [Trade Error] Failed to place order for {symbol}: {str(e)}"))
+
+    return notes
+
 
 async def manage_active_trades(bot) -> None:
+    """Poll pending/open trades without blocking the event loop."""
     admin_id = config.ADMIN_TELEGRAM_ID
     if not admin_id:
         return
 
+    notifications = await asyncio.to_thread(_manage_active_trades_sync, admin_id)
+    await _send_notifications(bot, admin_id, notifications)
+
+
+def _manage_active_trades_sync(admin_id: int) -> list[Notification]:
+    notes: list[Notification] = []
+
     admin_settings = db.get_user(admin_id)
     if not admin_settings:
-        return
-    
+        return notes
+
     order_ttl_min = admin_settings.get("order_ttl", 10)
 
     active_trades = db.get_active_trades()
     if not active_trades:
-        return
+        return notes
 
     try:
         session = get_session()
         pos_res = session.get_positions(category="linear", settleCoin="USDT")
         open_positions = {p["symbol"]: p for p in pos_res.get("result", {}).get("list", []) if float(p.get("size", 0)) > 0}
-    except Exception as e:
+    except Exception:
         logger.exception("Error querying positions from Bybit in manage_active_trades")
-        return
+        return notes
 
     now_ts = time.time()
 
@@ -282,23 +317,22 @@ async def manage_active_trades(bot) -> None:
                     orders_res = session.get_open_orders(category="linear", symbol=symbol, orderId=order_id)
                 else:
                     orders_res = session.get_open_orders(category="linear", symbol=symbol, orderLinkId=order_link_id)
-                
+
                 open_orders = orders_res.get("result", {}).get("list", [])
                 # Filter for truly pending orders
                 pending_orders = [o for o in open_orders if o.get("orderStatus") in ("New", "PartiallyFilled")]
-                
+
                 if pending_orders:
                     age_seconds = now_ts - trade["timestamp"]
                     if age_seconds > order_ttl_min * 60:
                         try:
                             session.cancel_order(category="linear", symbol=symbol, orderId=order_id or pending_orders[0]["orderId"])
                             db.update_trade(order_link_id, status="cancelled", closed_timestamp=now_ts)
-                            await bot.send_message(
-                                chat_id=admin_id,
-                                text=f"⏳ *Order Expired (TTL)*\nPending entry order for *{symbol.replace('USDT', '')}* was cancelled after {order_ttl_min} minutes.",
-                                parse_mode="Markdown"
-                            )
-                        except Exception as ce:
+                            notes.append(Notification(
+                                f"⏳ *Order Expired (TTL)*\nPending entry order for *{symbol.replace('USDT', '')}* was cancelled after {order_ttl_min} minutes.",
+                                parse_mode="Markdown",
+                            ))
+                        except Exception:
                             logger.exception("Error cancelling expired order %s", order_id)
                 else:
                     hist_res = session.get_order_history(
@@ -314,26 +348,23 @@ async def manage_active_trades(bot) -> None:
                         if status == "Filled":
                             avg_price = float(hist_order.get("avgPrice") or hist_order.get("price") or 0.0)
                             db.update_trade(order_link_id, status="open", entry_price=avg_price)
-                            await bot.send_message(
-                                chat_id=admin_id,
-                                text=f"✅ *Entry Order Filled*\n{symbol.replace('USDT', '')} short filled at *{avg_price} USDT*.",
-                                parse_mode="Markdown"
-                            )
+                            notes.append(Notification(
+                                f"✅ *Entry Order Filled*\n{symbol.replace('USDT', '')} short filled at *{avg_price} USDT*.",
+                                parse_mode="Markdown",
+                            ))
                         elif status in ("Cancelled", "Deactivated"):
                             db.update_trade(order_link_id, status="cancelled", closed_timestamp=now_ts)
-                            await bot.send_message(
-                                chat_id=admin_id,
-                                text=f"ℹ️ *Entry Order Cancelled*\n{symbol.replace('USDT', '')} entry order was cancelled.",
-                                parse_mode="Markdown"
-                            )
+                            notes.append(Notification(
+                                f"ℹ️ *Entry Order Cancelled*\n{symbol.replace('USDT', '')} entry order was cancelled.",
+                                parse_mode="Markdown",
+                            ))
                         elif status == "Rejected":
                             db.update_trade(order_link_id, status="error", closed_timestamp=now_ts)
-                            await bot.send_message(
-                                chat_id=admin_id,
-                                text=f"❌ *Entry Order Rejected*\n{symbol.replace('USDT', '')} entry order was rejected.",
-                                parse_mode="Markdown"
-                            )
-            except Exception as e:
+                            notes.append(Notification(
+                                f"❌ *Entry Order Rejected*\n{symbol.replace('USDT', '')} entry order was rejected.",
+                                parse_mode="Markdown",
+                            ))
+            except Exception:
                 logger.exception("Error polling pending trade %s", order_link_id)
 
         elif trade_status == "open":
@@ -346,7 +377,7 @@ async def manage_active_trades(bot) -> None:
                         closed_pnl = float(last_pnl.get("closedPnl", 0.0))
                         exit_price = float(last_pnl.get("avgExitPrice", 0.0))
                         closing_order_id = last_pnl.get("orderId")
-                        
+
                         stop_type = None
                         if closing_order_id:
                             try:
@@ -361,7 +392,7 @@ async def manage_active_trades(bot) -> None:
                                     stop_type = close_order.get("stopOrderType") or close_order.get("createType")
                             except Exception:
                                 logger.exception("Failed to query closing order history for details")
-                        
+
                         pnl_sign = "+" if closed_pnl >= 0 else ""
                         if stop_type == "TakeProfit" or (stop_type and "TakeProfit" in stop_type):
                             new_status = "tp_hit"
@@ -377,18 +408,20 @@ async def manage_active_trades(bot) -> None:
                             order_link_id,
                             status=new_status,
                             realized_pnl=closed_pnl,
-                            closed_timestamp=now_ts
+                            closed_timestamp=now_ts,
                         )
-                        await bot.send_message(chat_id=admin_id, text=msg, parse_mode="Markdown")
+                        notes.append(Notification(msg, parse_mode="Markdown"))
                     else:
                         db.update_trade(order_link_id, status="closed", closed_timestamp=now_ts)
-                        await bot.send_message(
-                            chat_id=admin_id,
-                            text=f"🚪 *Position Closed*\n{symbol.replace('USDT', '')} position is no longer active.",
-                            parse_mode="Markdown"
-                        )
-                except Exception as e:
+                        notes.append(Notification(
+                            f"🚪 *Position Closed*\n{symbol.replace('USDT', '')} position is no longer active.",
+                            parse_mode="Markdown",
+                        ))
+                except Exception:
                     logger.exception("Error checking closed P&L for open trade %s", order_link_id)
+
+    return notes
+
 
 def get_bot_positions_info():
     active_trades = db.get_active_trades()
@@ -400,7 +433,7 @@ def get_bot_positions_info():
         session = get_session()
         pos_res = session.get_positions(category="linear", settleCoin="USDT")
         positions = pos_res.get("result", {}).get("list", [])
-        
+
         info = []
         for p in positions:
             sym = p["symbol"]

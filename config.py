@@ -37,6 +37,8 @@ COINGLASS_URL = "https://www.coinglass.com/tv/Bybit_{symbol}"
 # ── Trading Configuration ────────────────────────────────
 ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID")) if os.getenv("ADMIN_TELEGRAM_ID") else None
 
+TRADING_HTTP_TIMEOUT = 5  # seconds – bound each Bybit trading call
+
 OFFSETS = [0, 1, 2, 3]
 SHORT_SIZES = [100, 200, 300, 400, 500]
 TP_SIZES = [3, 5, 7, 10, 15]
