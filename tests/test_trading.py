@@ -116,10 +116,14 @@ class TradingTestCase(unittest.TestCase):
         self.session = FakeSession()
         self._orig_session = trading._session
         trading._session = self.session
+        trading._instrument_cache.clear()
+        trading._configured_symbols.clear()
 
         self.bot = FakeBot()
 
     def tearDown(self):
+        trading._instrument_cache.clear()
+        trading._configured_symbols.clear()
         trading._session = self._orig_session
         config.ADMIN_TELEGRAM_ID = self._orig_admin
         db.DB_PATH = self._orig_db_path
@@ -225,6 +229,51 @@ class TradingTestCase(unittest.TestCase):
         trades = [db.get_trade(kw["orderLinkId"]) for kw in [self.session.calls_to("place_order")[0]]]
         self.assertEqual(trades[0]["status"], "error")
         self.assertIn("Failed to place order", self.all_texts())
+
+    # ── caching (instruments-info + leverage setup) ──────
+
+    def _clear_trades(self):
+        """Remove trade rows so a repeat signal in the same second can insert."""
+        with db._conn() as con:
+            con.execute("DELETE FROM trades")
+
+    def test_instrument_info_and_leverage_fetched_once_per_symbol(self):
+        self.open_trade("AAAUSDT")
+        self._clear_trades()
+        self.open_trade("AAAUSDT")
+
+        self.assertEqual(len(self.session.calls_to("place_order")), 2)
+        self.assertEqual(len(self.session.calls_to("get_instruments_info")), 1)
+        self.assertEqual(len(self.session.calls_to("set_leverage")), 1)
+        self.assertEqual(len(self.session.calls_to("switch_position_mode")), 1)
+
+    def test_different_symbols_fetch_their_own_info(self):
+        self.open_trade("AAAUSDT")
+        self.open_trade("BBBUSDT")
+        self.assertEqual(len(self.session.calls_to("get_instruments_info")), 2)
+        self.assertEqual(len(self.session.calls_to("set_leverage")), 2)
+
+    def test_instrument_cache_expires_after_ttl(self):
+        self.open_trade("AAAUSDT")
+        # Backdate the cache entry past the TTL
+        ts, info = trading._instrument_cache["AAAUSDT"]
+        trading._instrument_cache["AAAUSDT"] = (ts - trading.INSTRUMENT_CACHE_TTL - 1, info)
+        self._clear_trades()
+        self.open_trade("AAAUSDT")
+        self.assertEqual(len(self.session.calls_to("get_instruments_info")), 2)
+
+    def test_leverage_setup_retried_after_failure(self):
+        self.session.raise_on["set_leverage"] = RuntimeError("api down")
+        self.open_trade("AAAUSDT")
+        self.assertEqual(self.session.calls_to("place_order"), [])
+        self.assertIn("Failed to set leverage", self.all_texts())
+
+        # Symbol must not be memoized as configured; next attempt retries
+        del self.session.raise_on["set_leverage"]
+        self._clear_trades()
+        self.open_trade("AAAUSDT")
+        self.assertEqual(len(self.session.calls_to("set_leverage")), 2)
+        self.assertEqual(len(self.session.calls_to("place_order")), 1)
 
     # ── manage_active_trades ─────────────────────────────
 

@@ -22,6 +22,15 @@ logger = logging.getLogger(__name__)
 
 _session = None
 
+# Instrument constraints (tick size, lot rules, leverage cap) barely change,
+# so cache them per symbol instead of re-fetching on every trade.
+INSTRUMENT_CACHE_TTL = 12 * 3600  # seconds
+_instrument_cache: dict[str, tuple[float, dict]] = {}  # symbol -> (fetched_ts, info)
+
+# Symbols whose leverage/position mode were already configured this run;
+# both are sticky on Bybit's side, so setting them once per symbol is enough.
+_configured_symbols: set[str] = set()
+
 
 @dataclass(frozen=True, slots=True)
 class Notification:
@@ -53,6 +62,18 @@ def get_decimal_places(step: float) -> int:
 def round_step(val: float, step: float) -> float:
     decimals = get_decimal_places(step)
     return round(round(val / step) * step, decimals)
+
+
+def _get_symbol_info(session, symbol: str) -> dict:
+    """Return instruments-info for a symbol, cached with a TTL."""
+    cached = _instrument_cache.get(symbol)
+    now = time.time()
+    if cached and now - cached[0] < INSTRUMENT_CACHE_TTL:
+        return cached[1]
+    instr = session.get_instruments_info(category="linear", symbol=symbol)
+    symbol_info = instr["result"]["list"][0]
+    _instrument_cache[symbol] = (now, symbol_info)
+    return symbol_info
 
 
 async def _send_notifications(bot, admin_id: int, notifications: list[Notification]) -> None:
@@ -132,10 +153,9 @@ def _try_open_trade_sync(admin_id: int, symbol: str, trigger_price: float) -> li
         notes.append(Notification(f"❌ [Trade Error] Failed to check Bybit status: {str(e)}"))
         return notes
 
-    # 4. Fetch symbol constraints
+    # 4. Fetch symbol constraints (cached)
     try:
-        instr = session.get_instruments_info(category="linear", symbol=symbol)
-        symbol_info = instr["result"]["list"][0]
+        symbol_info = _get_symbol_info(session, symbol)
         tick_size = float(symbol_info["priceFilter"]["tickSize"])
         qty_step = float(symbol_info["lotSizeFilter"]["qtyStep"])
         min_qty = float(symbol_info["lotSizeFilter"]["minOrderQty"])
@@ -200,37 +220,41 @@ def _try_open_trade_sync(admin_id: int, symbol: str, trigger_price: float) -> li
         notes.append(Notification(f"❌ [Trade Error] Database write failed for {symbol}: {str(e)}"))
         return notes
 
-    # 7. Configure Leverage & Position mode on Bybit
+    # 7. Configure Leverage & Position mode on Bybit (once per symbol per run;
+    # both settings are sticky on Bybit's side).
     # Symbols cap leverage individually (small caps often allow only 5x or less),
     # so clamp the desired 10x to the symbol's maximum.
-    leverage = min(10.0, max_leverage)
-    leverage_str = f"{leverage:g}"
-    try:
+    if symbol not in _configured_symbols:
+        leverage = min(10.0, max_leverage)
+        leverage_str = f"{leverage:g}"
         try:
-            session.set_leverage(
-                category="linear",
-                symbol=symbol,
-                buyLeverage=leverage_str,
-                sellLeverage=leverage_str,
-            )
-        except InvalidRequestError as le:
-            if le.status_code != 110043 and "leverage not modified" not in str(le):
-                raise le
+            try:
+                session.set_leverage(
+                    category="linear",
+                    symbol=symbol,
+                    buyLeverage=leverage_str,
+                    sellLeverage=leverage_str,
+                )
+            except InvalidRequestError as le:
+                if le.status_code != 110043 and "leverage not modified" not in str(le):
+                    raise le
 
-        try:
-            session.switch_position_mode(
-                category="linear",
-                symbol=symbol,
-                mode=0,
-            )
-        except InvalidRequestError as pe:
-            if pe.status_code != 110025 and "Position mode is not modified" not in str(pe):
-                raise pe
-    except Exception as e:
-        logger.exception("Error setting leverage/position mode for %s", symbol)
-        db.update_trade(order_link_id, status="error")
-        notes.append(Notification(f"❌ [Trade Error] Failed to set leverage/position mode for {symbol}: {str(e)}"))
-        return notes
+            try:
+                session.switch_position_mode(
+                    category="linear",
+                    symbol=symbol,
+                    mode=0,
+                )
+            except InvalidRequestError as pe:
+                if pe.status_code != 110025 and "Position mode is not modified" not in str(pe):
+                    raise pe
+
+            _configured_symbols.add(symbol)
+        except Exception as e:
+            logger.exception("Error setting leverage/position mode for %s", symbol)
+            db.update_trade(order_link_id, status="error")
+            notes.append(Notification(f"❌ [Trade Error] Failed to set leverage/position mode for {symbol}: {str(e)}"))
+            return notes
 
     # 8. Place Order
     try:
