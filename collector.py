@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 _dispatch_tasks: set[asyncio.Task] = set()
 _send_semaphore: asyncio.Semaphore | None = None
 _user_send_locks: dict[int, asyncio.Lock] = {}
+_inflight_trade_symbols: set[str] = set()
 
 
 # ── Bybit helpers ────────────────────────────────────────
@@ -38,6 +39,7 @@ class Alert:
     symbol: str
     text_prefix: str
     alert_type: str
+    trigger_price: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,9 +157,45 @@ async def collect_and_alert(bot) -> None:
     if not alerts:
         return
 
+    # Trades fire off the detection signal itself, before (and independent of)
+    # Telegram alert delivery, using the price of the tick that triggered.
+    _spawn_admin_trades(bot, alerts)
+
     task = asyncio.create_task(_dispatch_alerts(bot, alerts))
     _dispatch_tasks.add(task)
     task.add_done_callback(_dispatch_tasks.discard)
+
+
+def _spawn_admin_trades(bot, alerts: list[Alert]) -> None:
+    """Spawn a trade task for each of the admin's pump signals in this batch.
+
+    An in-flight guard prevents overlapping trade attempts for the same
+    symbol across consecutive ticks (e.g. while Telegram delivery – which
+    writes the alert cooldown – is failing).
+    """
+    if not ADMIN_TELEGRAM_ID:
+        return
+    for alert in alerts:
+        if (
+            alert.user_id == ADMIN_TELEGRAM_ID
+            and alert.alert_type == "pump"
+            and alert.trigger_price > 0
+            and alert.symbol not in _inflight_trade_symbols
+        ):
+            _inflight_trade_symbols.add(alert.symbol)
+            task = asyncio.create_task(_run_admin_trade(bot, alert.symbol, alert.trigger_price))
+            _dispatch_tasks.add(task)
+            task.add_done_callback(_dispatch_tasks.discard)
+
+
+async def _run_admin_trade(bot, symbol: str, trigger_price: float) -> None:
+    """Execute one trade attempt and release the in-flight slot for the symbol."""
+    try:
+        await trading.try_open_trade(bot, symbol, trigger_price)
+    except Exception:
+        logger.exception("Unhandled error in trade task for %s", symbol)
+    finally:
+        _inflight_trade_symbols.discard(symbol)
 
 
 def _build_alert_batch(prices: list[tuple[str, float]]) -> list[Alert]:
@@ -184,12 +222,12 @@ def _build_alert_batch(prices: list[tuple[str, float]]) -> list[Alert]:
     alerts: list[Alert] = []
     for user in users:
         uid = user["user_id"]
-        alerts.extend(_collect_pump_alerts(user, change_results, now, uid, cooldown_map))
-        alerts.extend(_collect_dump_alerts(user, change_results, now, uid, cooldown_map))
+        alerts.extend(_collect_pump_alerts(user, change_results, now, uid, cooldown_map, current_map))
+        alerts.extend(_collect_dump_alerts(user, change_results, now, uid, cooldown_map, current_map))
     return alerts
 
 
-def _collect_pump_alerts(user, change_results, now, uid, cooldown_map) -> list[Alert]:
+def _collect_pump_alerts(user, change_results, now, uid, cooldown_map, current_map) -> list[Alert]:
     """Build pump alerts for a single user."""
     threshold = user["pump_threshold"]
     tw = user["pump_time_window"]
@@ -212,11 +250,17 @@ def _collect_pump_alerts(user, change_results, now, uid, cooldown_map) -> list[A
                 f"🏦[ByBit]({bybit_url}) – {tw}m – [{coin}]({coinglass_url})\n"
                 f"🟢*Pump*: *{pct}%*"
             )
-            alerts.append(Alert(user_id=uid, symbol=symbol, text_prefix=text_prefix, alert_type="pump"))
+            alerts.append(Alert(
+                user_id=uid,
+                symbol=symbol,
+                text_prefix=text_prefix,
+                alert_type="pump",
+                trigger_price=current_map.get(symbol, 0.0),
+            ))
     return alerts
 
 
-def _collect_dump_alerts(user, change_results, now, uid, cooldown_map) -> list[Alert]:
+def _collect_dump_alerts(user, change_results, now, uid, cooldown_map, current_map) -> list[Alert]:
     """Build dump alerts for a single user."""
     threshold = user["dump_threshold"]
     tw = user["dump_time_window"]
@@ -240,7 +284,13 @@ def _collect_dump_alerts(user, change_results, now, uid, cooldown_map) -> list[A
                 f"🏦[ByBit]({bybit_url}) – {tw}m – [{coin}]({coinglass_url})\n"
                 f"🔴*Dump*: *{pct}%*"
             )
-            alerts.append(Alert(user_id=uid, symbol=symbol, text_prefix=text_prefix, alert_type="dump"))
+            alerts.append(Alert(
+                user_id=uid,
+                symbol=symbol,
+                text_prefix=text_prefix,
+                alert_type="dump",
+                trigger_price=current_map.get(symbol, 0.0),
+            ))
     return alerts
 
 
@@ -276,12 +326,6 @@ async def _send_user_alerts(bot, user_id: int, alerts: list[Alert]) -> None:
                 await asyncio.to_thread(
                     db.set_alert_cooldown, user_id, alert.symbol, time.time()
                 )
-                # Trigger trading for admin if it's a pump alert
-                if user_id == ADMIN_TELEGRAM_ID and alert.alert_type == "pump":
-                    latest_prices = await asyncio.to_thread(db.get_latest_prices)
-                    trigger_price = latest_prices.get(alert.symbol)
-                    if trigger_price:
-                        asyncio.create_task(trading.try_open_trade(bot, alert.symbol, trigger_price))
 
 
 async def _send_alert(bot, user_id: int, text: str) -> bool:
